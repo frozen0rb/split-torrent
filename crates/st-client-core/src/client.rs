@@ -11,8 +11,8 @@ use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use rustls::pki_types::ServerName;
 use st_protocol::{
-    client_framed, ClientMessage, ErrorCode, ProtocolError, ServerMessage, TorrentId,
-    TorrentState, DEFAULT_PORT, PROTOCOL_VERSION,
+    client_framed, ClientMessage, ErrorCode, ProtocolError, ServerMessage, TorrentId, TorrentState,
+    DEFAULT_PORT, PROTOCOL_VERSION,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
@@ -87,7 +87,12 @@ fn parse_server(s: &str) -> Result<(String, u16), ConfigError> {
     if s.is_empty() {
         return Err(ConfigError::EmptyAddress);
     }
-    let port = |p: &str| p.parse::<u16>().ok().filter(|&p| p != 0).ok_or(ConfigError::BadPort);
+    let port = |p: &str| {
+        p.parse::<u16>()
+            .ok()
+            .filter(|&p| p != 0)
+            .ok_or(ConfigError::BadPort)
+    };
     if let Some(rest) = s.strip_prefix('[') {
         let (host, tail) = rest.split_once(']').ok_or(ConfigError::EmptyAddress)?;
         return match tail.strip_prefix(':') {
@@ -186,7 +191,10 @@ enum Command {
     Add(Box<Torrent>),
     Pause(InfoHash),
     Resume(InfoHash),
-    Remove { info_hash: InfoHash, delete_files: bool },
+    Remove {
+        info_hash: InfoHash,
+        delete_files: bool,
+    },
     Shutdown,
 }
 
@@ -504,7 +512,9 @@ impl Actor {
         };
         *hello_ok = true;
         self.online = true;
-        self.emit(Event::Connection(ConnectionState::Connected { buffer_limit }));
+        self.emit(Event::Connection(ConnectionState::Connected {
+            buffer_limit,
+        }));
         self.queue_adds();
 
         let mut flush_tick = tokio::time::interval(FLUSH_INTERVAL);

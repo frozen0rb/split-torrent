@@ -68,10 +68,7 @@ impl Metainfo {
         if raw.len() % 20 != 0 {
             return Err(invalid("pieces length not a multiple of 20"));
         }
-        let pieces: Vec<[u8; 20]> = raw
-            .chunks_exact(20)
-            .map(|c| c.try_into().expect("20 bytes"))
-            .collect();
+        let pieces: Vec<[u8; 20]> = raw.as_chunks::<20>().0.to_vec();
 
         let mut files = Vec::new();
         let mut offset = 0u64;
@@ -116,7 +113,9 @@ impl Metainfo {
                     offset,
                     pad,
                 });
-                offset = offset.checked_add(length).ok_or(invalid("total too large"))?;
+                offset = offset
+                    .checked_add(length)
+                    .ok_or(invalid("total too large"))?;
             }
         }
 
@@ -169,7 +168,12 @@ impl Metainfo {
             .map(|(i, f)| {
                 let s = start.max(f.offset);
                 let e = end.min(f.offset + f.length);
-                (first + i, s - f.offset, (s - start) as usize, (e - s) as usize)
+                (
+                    first + i,
+                    s - f.offset,
+                    (s - start) as usize,
+                    (e - s) as usize,
+                )
             })
             .collect()
     }
@@ -186,7 +190,8 @@ impl Metainfo {
 }
 
 fn non_negative(v: Option<&Value>) -> Option<u64> {
-    v.and_then(Value::as_int).and_then(|i| u64::try_from(i).ok())
+    v.and_then(Value::as_int)
+        .and_then(|i| u64::try_from(i).ok())
 }
 
 fn utf8_field(v: &Value, key: &str) -> Option<String> {
@@ -215,14 +220,22 @@ pub fn sanitize_component(raw: &str) -> String {
     if s.is_empty() {
         return "_".into();
     }
-    let stem = s.split('.').next().unwrap_or("").trim_end().to_ascii_uppercase();
+    let stem = s
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim_end()
+        .to_ascii_uppercase();
     let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
         || ((stem.starts_with("COM") || stem.starts_with("LPT"))
             && stem.len() == 4
             && stem.as_bytes()[3].is_ascii_digit());
     let s = if reserved { format!("_{s}") } else { s };
     debug_assert!(
-        matches!(Path::new(&s).components().collect::<Vec<_>>()[..], [Component::Normal(_)]),
+        matches!(
+            Path::new(&s).components().collect::<Vec<_>>()[..],
+            [Component::Normal(_)]
+        ),
         "{s:?}"
     );
     s

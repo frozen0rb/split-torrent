@@ -85,7 +85,10 @@ pub fn decode(buf: &[u8]) -> Result<Value, DecodeError> {
 
 /// Decodes `buf` and also returns the raw byte range of the top-level
 /// dictionary's value under `key` (used for the info-hash).
-pub fn decode_with_span(buf: &[u8], key: &[u8]) -> Result<(Value, Option<Range<usize>>), DecodeError> {
+pub fn decode_with_span(
+    buf: &[u8],
+    key: &[u8],
+) -> Result<(Value, Option<Range<usize>>), DecodeError> {
     let mut p = Parser { buf, pos: 0 };
     let mut span = None;
     let v = p.value(0, Some((key, &mut span)))?;
@@ -168,7 +171,8 @@ impl Parser<'_> {
         while self.peek()? != end {
             self.pos += 1;
         }
-        let s = std::str::from_utf8(&self.buf[start..self.pos]).map_err(|_| self.err("bad number"))?;
+        let s =
+            std::str::from_utf8(&self.buf[start..self.pos]).map_err(|_| self.err("bad number"))?;
         self.pos += 1;
         s.parse().map_err(|_| self.err("bad number"))
     }

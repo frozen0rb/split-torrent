@@ -71,7 +71,8 @@ async fn mock_server() -> Mock {
 
 impl Mock {
     fn config(&self, token: &str, fingerprint: Fingerprint) -> ClientConfig {
-        let mut c = ClientConfig::new(&self.addr.to_string(), token, &fingerprint.to_string()).unwrap();
+        let mut c =
+            ClientConfig::new(&self.addr.to_string(), token, &fingerprint.to_string()).unwrap();
         c.backoff = Backoff {
             min: Duration::from_millis(50),
             max: Duration::from_millis(300),
@@ -80,7 +81,10 @@ impl Mock {
     }
 
     async fn next_conn(&mut self) -> Conn {
-        tokio::time::timeout(T, self.conns.recv()).await.unwrap().unwrap()
+        tokio::time::timeout(T, self.conns.recv())
+            .await
+            .unwrap()
+            .unwrap()
     }
 }
 
@@ -107,10 +111,17 @@ async fn accept_torrent(conn: &mut Conn, meta: &Metainfo, id: u32) -> Bitfield {
     })
     .await
     .unwrap();
-    let ClientMessage::AddTorrent { torrent_bytes, have } = recv(conn).await else {
+    let ClientMessage::AddTorrent {
+        torrent_bytes,
+        have,
+    } = recv(conn).await
+    else {
         panic!("expected AddTorrent");
     };
-    assert_eq!(Metainfo::parse(&torrent_bytes).unwrap().info_hash, meta.info_hash);
+    assert_eq!(
+        Metainfo::parse(&torrent_bytes).unwrap().info_hash,
+        meta.info_hash
+    );
     conn.send(ServerMessage::TorrentAdded {
         torrent_id: id,
         info_hash: meta.info_hash,
@@ -184,7 +195,10 @@ fn fixture() -> Fixture {
         ("season 1/ep2.mkv".to_string(), pseudo_random(3333, 2)),
         ("readme.txt".to_string(), pseudo_random(17, 3)),
     ];
-    let refs: Vec<(&str, &[u8])> = files.iter().map(|(p, d)| (p.as_str(), d.as_slice())).collect();
+    let refs: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(p, d)| (p.as_str(), d.as_slice()))
+        .collect();
     let (torrent, pieces) = make_torrent("Show", &refs, 1024);
     let meta = Metainfo::parse(&torrent).unwrap();
     Fixture {
@@ -215,7 +229,9 @@ async fn downloads_and_resumes_after_disconnect() {
         &tokio::runtime::Handle::current(),
         None,
     );
-    let snap = client.add_torrent(f.torrent.clone(), dir.path(), false).unwrap();
+    let snap = client
+        .add_torrent(f.torrent.clone(), dir.path(), false)
+        .unwrap();
     assert_eq!(snap.pieces_have, 0);
     assert!(matches!(
         client.add_torrent(f.torrent.clone(), dir.path(), false),
@@ -263,7 +279,10 @@ async fn downloads_and_resumes_after_disconnect() {
     assert_files(dir.path(), &f);
 
     client.shutdown();
-    wait_event(&mut rx, |e| matches!(e, Event::Connection(ConnectionState::Stopped))).await;
+    wait_event(&mut rx, |e| {
+        matches!(e, Event::Connection(ConnectionState::Stopped))
+    })
+    .await;
 
     // A new client (e.g. after an app restart) resumes from `.st-state` and
     // does not register a finished torrent again.
@@ -272,7 +291,9 @@ async fn downloads_and_resumes_after_disconnect() {
         &tokio::runtime::Handle::current(),
         None,
     );
-    let snap = client.add_torrent(f.torrent.clone(), dir.path(), false).unwrap();
+    let snap = client
+        .add_torrent(f.torrent.clone(), dir.path(), false)
+        .unwrap();
     assert!(snap.complete());
     let mut conn = mock.next_conn().await;
     recv(&mut conn).await;
@@ -282,8 +303,15 @@ async fn downloads_and_resumes_after_disconnect() {
     })
     .await
     .unwrap();
-    wait_event(&mut rx, |e| matches!(e, Event::Connection(ConnectionState::Connected { .. }))).await;
-    assert!(tokio::time::timeout(Duration::from_millis(300), conn.next()).await.is_err());
+    wait_event(&mut rx, |e| {
+        matches!(e, Event::Connection(ConnectionState::Connected { .. }))
+    })
+    .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), conn.next())
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -296,7 +324,9 @@ async fn corrupt_piece_forces_reconnect_without_ack() {
         &tokio::runtime::Handle::current(),
         None,
     );
-    client.add_torrent(f.torrent.clone(), dir.path(), false).unwrap();
+    client
+        .add_torrent(f.torrent.clone(), dir.path(), false)
+        .unwrap();
     let mut conn = mock.next_conn().await;
     accept_torrent(&mut conn, &f.meta, 1).await;
     let mut bad = f.pieces[3].clone();
@@ -339,17 +369,35 @@ async fn pause_resume_remove_are_forwarded() {
         None,
     );
     // Added paused: the client pauses it right after registration.
-    let snap = client.add_torrent(f.torrent.clone(), dir.path(), true).unwrap();
+    let snap = client
+        .add_torrent(f.torrent.clone(), dir.path(), true)
+        .unwrap();
     let mut conn = mock.next_conn().await;
     accept_torrent(&mut conn, &f.meta, 5).await;
-    assert_eq!(recv(&mut conn).await, ClientMessage::Pause { torrent_id: 5 });
+    assert_eq!(
+        recv(&mut conn).await,
+        ClientMessage::Pause { torrent_id: 5 }
+    );
     client.resume(snap.info_hash);
-    assert_eq!(recv(&mut conn).await, ClientMessage::Resume { torrent_id: 5 });
+    assert_eq!(
+        recv(&mut conn).await,
+        ClientMessage::Resume { torrent_id: 5 }
+    );
     client.pause(snap.info_hash);
-    assert_eq!(recv(&mut conn).await, ClientMessage::Pause { torrent_id: 5 });
+    assert_eq!(
+        recv(&mut conn).await,
+        ClientMessage::Pause { torrent_id: 5 }
+    );
     client.remove(snap.info_hash, true);
-    assert_eq!(recv(&mut conn).await, ClientMessage::Remove { torrent_id: 5 });
-    wait_event(&mut rx, |e| matches!(e, Event::Removed(ih) if *ih == snap.info_hash)).await;
+    assert_eq!(
+        recv(&mut conn).await,
+        ClientMessage::Remove { torrent_id: 5 }
+    );
+    wait_event(
+        &mut rx,
+        |e| matches!(e, Event::Removed(ih) if *ih == snap.info_hash),
+    )
+    .await;
     assert!(!dir.path().join("Show").exists());
     // Pieces for a removed torrent are ignored.
     conn.send(ServerMessage::Piece {
@@ -359,10 +407,19 @@ async fn pause_resume_remove_are_forwarded() {
     })
     .await
     .unwrap();
-    assert!(tokio::time::timeout(Duration::from_millis(300), conn.next()).await.is_err());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), conn.next())
+            .await
+            .is_err()
+    );
     // It can be added again afterwards.
-    client.add_torrent(f.torrent.clone(), dir.path(), false).unwrap();
-    assert!(matches!(recv(&mut conn).await, ClientMessage::AddTorrent { .. }));
+    client
+        .add_torrent(f.torrent.clone(), dir.path(), false)
+        .unwrap();
+    assert!(matches!(
+        recv(&mut conn).await,
+        ClientMessage::AddTorrent { .. }
+    ));
 }
 
 #[tokio::test]
@@ -382,9 +439,11 @@ async fn wrong_fingerprint_is_rejected() {
     };
     assert!(error.contains("fingerprint"), "{error}");
     assert_eq!(retry_in, Duration::from_millis(300));
-    assert!(tokio::time::timeout(Duration::from_millis(200), mock.conns.recv())
-        .await
-        .is_err());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), mock.conns.recv())
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -397,7 +456,9 @@ async fn bad_token_reports_server_error_and_retries() {
     );
     for _ in 0..2 {
         let mut conn = mock.next_conn().await;
-        assert!(matches!(recv(&mut conn).await, ClientMessage::Hello { token, .. } if token == "wrong"));
+        assert!(
+            matches!(recv(&mut conn).await, ClientMessage::Hello { token, .. } if token == "wrong")
+        );
         conn.send(ServerMessage::Error {
             torrent_id: None,
             code: ErrorCode::Unauthorized,

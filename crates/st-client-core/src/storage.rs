@@ -67,7 +67,10 @@ impl Storage {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).map_err(io_err(parent))?;
             }
-            let existing = fs::metadata(&path).ok().filter(|m| m.is_file()).map(|m| m.len());
+            let existing = fs::metadata(&path)
+                .ok()
+                .filter(|m| m.is_file())
+                .map(|m| m.len());
             let file = OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -140,7 +143,10 @@ impl Storage {
             let Some(file) = self.files[fi].as_mut() else {
                 continue;
             };
-            let path = || self.download_dir.join(self.meta.file_path(&self.meta.files[fi]));
+            let path = || {
+                self.download_dir
+                    .join(self.meta.file_path(&self.meta.files[fi]))
+            };
             file.seek(SeekFrom::Start(file_off))
                 .and_then(|_| file.write_all(&data[piece_off..piece_off + len]))
                 .map_err(|e| io_err(&path())(e))?;
@@ -161,7 +167,9 @@ impl Storage {
             let Some(file) = self.files[fi].as_mut() else {
                 continue;
             };
-            let path = self.download_dir.join(self.meta.file_path(&self.meta.files[fi]));
+            let path = self
+                .download_dir
+                .join(self.meta.file_path(&self.meta.files[fi]));
             file.seek(SeekFrom::Start(file_off))
                 .and_then(|_| file.read_exact(&mut buf[piece_off..piece_off + len]))
                 .map_err(io_err(&path))?;
@@ -174,7 +182,9 @@ impl Storage {
         for (i, dirty) in self.dirty.iter_mut().enumerate() {
             if *dirty {
                 if let Some(f) = &self.files[i] {
-                    let path = self.download_dir.join(self.meta.file_path(&self.meta.files[i]));
+                    let path = self
+                        .download_dir
+                        .join(self.meta.file_path(&self.meta.files[i]));
                     f.sync_data().map_err(io_err(&path))?;
                 }
                 *dirty = false;
@@ -297,9 +307,18 @@ mod tests {
         let mut s = Storage::open(meta, tmp.path()).unwrap();
         let mut bad = pieces[0].clone();
         bad[0] ^= 1;
-        assert!(matches!(s.write_piece(0, &bad), Err(StorageError::HashMismatch(0))));
-        assert!(matches!(s.write_piece(0, &bad[1..]), Err(StorageError::WrongSize { .. })));
-        assert!(matches!(s.write_piece(9, &bad), Err(StorageError::OutOfRange(9))));
+        assert!(matches!(
+            s.write_piece(0, &bad),
+            Err(StorageError::HashMismatch(0))
+        ));
+        assert!(matches!(
+            s.write_piece(0, &bad[1..]),
+            Err(StorageError::WrongSize { .. })
+        ));
+        assert!(matches!(
+            s.write_piece(9, &bad),
+            Err(StorageError::OutOfRange(9))
+        ));
         assert_eq!(s.have().count_ones(), 0);
     }
 

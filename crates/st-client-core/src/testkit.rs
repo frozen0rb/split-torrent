@@ -9,15 +9,25 @@ use crate::bencode::Value;
 /// Builds a v1 torrent. A single entry whose path equals `name` produces the
 /// single-file layout; anything else is multi-file with `/`-separated paths.
 /// Returns the torrent bytes and the pieces' data.
-pub fn make_torrent(name: &str, files: &[(&str, &[u8])], piece_length: u32) -> (Vec<u8>, Vec<Vec<u8>>) {
+pub fn make_torrent(
+    name: &str,
+    files: &[(&str, &[u8])],
+    piece_length: u32,
+) -> (Vec<u8>, Vec<Vec<u8>>) {
     let all: Vec<u8> = files.iter().flat_map(|(_, d)| d.iter().copied()).collect();
-    let pieces: Vec<Vec<u8>> = all.chunks(piece_length as usize).map(<[u8]>::to_vec).collect();
-    let hashes: Vec<u8> = pieces.iter().flat_map(|p| Sha1::digest(p)).collect();
+    let pieces: Vec<Vec<u8>> = all
+        .chunks(piece_length as usize)
+        .map(<[u8]>::to_vec)
+        .collect();
+    let hashes: Vec<u8> = pieces.iter().flat_map(Sha1::digest).collect();
 
     let s = |v: &str| Value::Bytes(v.as_bytes().to_vec());
     let mut info = BTreeMap::new();
     info.insert(b"name".to_vec(), s(name));
-    info.insert(b"piece length".to_vec(), Value::Int(i64::from(piece_length)));
+    info.insert(
+        b"piece length".to_vec(),
+        Value::Int(i64::from(piece_length)),
+    );
     info.insert(b"pieces".to_vec(), Value::Bytes(hashes));
     if let [(path, data)] = files {
         if *path == name {
@@ -49,7 +59,9 @@ pub fn make_torrent(name: &str, files: &[(&str, &[u8])], piece_length: u32) -> (
 
 /// Deterministic pseudo-random bytes.
 pub fn pseudo_random(len: usize, seed: u64) -> Vec<u8> {
-    let mut x = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    let mut x = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     (0..len)
         .map(|_| {
             x ^= x << 13;

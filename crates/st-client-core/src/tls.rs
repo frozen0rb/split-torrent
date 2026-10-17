@@ -35,7 +35,7 @@ impl Fingerprint {
             return Err(BadFingerprint);
         }
         let mut out = [0u8; 32];
-        for (o, pair) in out.iter_mut().zip(hex.chunks_exact(2)) {
+        for (o, pair) in out.iter_mut().zip(hex.as_chunks::<2>().0) {
             let pair = std::str::from_utf8(pair).map_err(|_| BadFingerprint)?;
             *o = u8::from_str_radix(pair, 16).map_err(|_| BadFingerprint)?;
         }
@@ -93,7 +93,12 @@ impl ServerCertVerifier for PinnedVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        verify_tls12_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+        verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
@@ -102,7 +107,12 @@ impl ServerCertVerifier for PinnedVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+        verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
@@ -135,7 +145,10 @@ mod tests {
         assert_eq!(Fingerprint::parse(&colon), Ok(fp));
         assert_eq!(Fingerprint::parse(&colon.to_lowercase()), Ok(fp));
         assert_eq!(Fingerprint::parse(&"ab".repeat(32)), Ok(fp));
-        assert_eq!(Fingerprint::parse(&format!("sha256:{}", "AB".repeat(32))), Ok(fp));
+        assert_eq!(
+            Fingerprint::parse(&format!("sha256:{}", "AB".repeat(32))),
+            Ok(fp)
+        );
         assert_eq!(
             Fingerprint::parse(&format!("sha256 Fingerprint={colon}")),
             Ok(fp)
