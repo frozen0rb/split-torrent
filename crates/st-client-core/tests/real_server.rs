@@ -169,6 +169,7 @@ fn assert_no_payload_on_server_disk(state_dir: &Path, test_dir: &Path, tag: &str
             );
         },
     );
+    assert!(total > 0, "state dir should hold the certificate and token");
     assert!(
         total < 256 * 1024 && total < payload / 20,
         "state dir holds {total} bytes"
