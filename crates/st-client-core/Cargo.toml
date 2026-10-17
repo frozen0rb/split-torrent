@@ -1,0 +1,27 @@
+[package]
+name = "st-client-core"
+description = "Platform-independent st-client logic: connection, piece writes, resume state"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+st-protocol.workspace = true
+bytes.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+sha1 = "0.10"
+
+[dev-dependencies]
+rcgen = "0.14"
+tempfile.workspace = true
+tokio-util.workspace = true
+
+# st-server is Linux-only; the real-server test runs on Unix.
+[target.'cfg(unix)'.dev-dependencies]
+st-server.workspace = true
+librqbit = { version = "9.0.1", default-features = false, features = ["rust-tls", "disable-upload"] }

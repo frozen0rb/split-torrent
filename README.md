@@ -207,20 +207,79 @@ not crowd out pieces waiting for ACK.
 
 ## Windows client
 
-> _To be completed with the `st-client` GUI._
+![st-client GUI](docs/images/client-gui.png)
 
-The client is a single `st-client.exe` (the `windows-msvc` CI artifact). In
-the GUI enter:
+### Install and run
+
+1. Download `st-client.exe` from the `windows-msvc` artifact of the latest CI
+   run (or build it with `cargo build --release -p st-client` on Windows).
+2. Put it anywhere and run it. Nothing else needs to be installed, and the
+   PC does not need a public IP: the client opens one outbound TLS
+   connection to the server.
+
+### Connecting
 
 | Field | Value |
 |---|---|
-| Server address | `your-server-ip:7443` |
+| Server address | `your-server-ip:7443` (port defaults to 7443; `[v6]:port` works too) |
 | Token | `token` from `st-server show` |
-| Certificate fingerprint | `fingerprint` from `st-server show` |
-| `.torrent` file | the torrent to download |
-| Download folder | where the files are written |
+| Certificate SHA-256 | `fingerprint` from `st-server show` (`AB:CD:…`, plain hex or `sha256:…`) |
 
-<!-- TODO(client): screenshots, install steps, resume/.st-state behaviour, pause/resume/remove. -->
+Press **Connect**. The client trusts only the certificate with exactly that
+fingerprint (TLS 1.3), then authenticates with the token. If the connection
+drops, it reconnects on its own with exponential backoff (1 s up to 30 s);
+the status line shows the last error and the retry countdown. A wrong token
+or fingerprint is retried every 30 s, so fix the field and press
+**Disconnect**/**Connect**.
+
+Settings are saved automatically (`%APPDATA%\split-torrent\data\app.ron`
+on Windows; the token is stored there in plain text). If you were connected
+when you closed the app, it reconnects on the next start.
+
+### Adding torrents
+
+Pick a `.torrent` file with **Browse…** (or drop it on the window), choose
+the **Download folder** and press **Add torrent**. A private copy of the
+`.torrent` is kept next to the settings, so the original can be deleted.
+
+Single-file torrents are written to `<folder>\<name>`, multi-file torrents
+to `<folder>\<name>\…`. All files are created at full size up front, and
+every piece is written straight to its offset. Names from the torrent are
+sanitized (no `..`, drive letters, reserved names like `CON`, or characters
+Windows forbids).
+
+The list shows per torrent: size, progress, status, the server's download
+speed from the swarm, the transfer speed from the server to this PC, and the
+number of peers. The footer shows how much of the server's RAM buffer is in
+use.
+
+### Resume and `.st-state`
+
+The client checks every piece's SHA-1 again, writes it, syncs the file and
+records the piece in `<folder>\<name>.st-state` (a small bitfield) before it
+acknowledges the piece to the server, so the server only frees pieces that
+are safely on disk. After a reconnect or an app restart the client sends
+this bitfield with the torrent, and only missing pieces are transferred.
+If a file was deleted or truncated, the pieces in it are fetched again.
+Deleting the `.st-state` file makes the client start that torrent from
+scratch.
+
+### Pause, resume, remove
+
+- **Pause** / **Resume** stop and restart the download on the server. The
+  state is remembered across restarts.
+- **Remove → Keep downloaded files** removes the torrent from the list and
+  from the server; files and `.st-state` stay, so adding the same torrent
+  again later resumes it.
+- **Remove → Delete downloaded files** also deletes the files and the
+  `.st-state`.
+- **Open** opens the download folder.
+
+### Trying the client without a server
+
+`cargo run -p st-client-core --example demo_server -- st-demo` starts a fake
+server on `127.0.0.1:7443` that serves two generated torrents (written to
+`st-demo/`) at a throttled rate and prints its token and fingerprint.
 
 ## Development
 
@@ -230,6 +289,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+`crates/st-client-core/tests/` covers the client against a mock server
+(resume after disconnect, corrupt piece, pause/resume/remove, wrong
+fingerprint, bad token) and against a real in-process `st-server` with a
+librqbit seed (download, client restart mid-download, byte-for-byte check).
 `crates/st-server/tests/swarm.rs` runs the server against a local librqbit seed
 (TLS pinning, bad token, full download, backpressure with a small buffer,
 reconnect before ACK). The server can be embedded in tests with
