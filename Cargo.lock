@@ -5287,11 +5287,12 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "futures",
+ "librqbit",
  "rcgen 0.14.10",
  "rustls",
  "sha1",
- "sha2",
  "st-protocol",
+ "st-server",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",

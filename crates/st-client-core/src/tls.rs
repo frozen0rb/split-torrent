@@ -5,10 +5,13 @@ use std::fmt;
 use std::sync::Arc;
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
+use rustls::crypto::{verify_tls13_signature, CryptoProvider};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
-use sha2::{Digest, Sha256};
+use st_protocol::{cert_fingerprint, format_fingerprint, parse_fingerprint};
+
+/// Name sent in SNI; the server's self-signed certificate is issued for it.
+pub const SERVER_NAME: &str = "st-server";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Fingerprint(pub [u8; 32]);
@@ -19,39 +22,19 @@ pub struct BadFingerprint;
 
 impl Fingerprint {
     pub fn of(cert_der: &[u8]) -> Self {
-        Self(Sha256::digest(cert_der).into())
+        Self(cert_fingerprint(cert_der))
     }
 
-    /// Accepts `AB:CD:…`, `abcd…`, optionally prefixed with `sha256:` or `SHA256 Fingerprint=`.
+    /// Accepts `AB:CD:…` or `abcd…`, optionally prefixed with `sha256:`, as
+    /// printed by `st-server show`.
     pub fn parse(s: &str) -> Result<Self, BadFingerprint> {
-        let s = s.trim();
-        let s = s.rsplit_once(['=', ' ']).map_or(s, |(_, r)| r);
-        let s = s
-            .strip_prefix("sha256:")
-            .or_else(|| s.strip_prefix("SHA256:"))
-            .unwrap_or(s);
-        let hex: Vec<u8> = s.bytes().filter(|b| !matches!(b, b':' | b'-')).collect();
-        if hex.len() != 64 {
-            return Err(BadFingerprint);
-        }
-        let mut out = [0u8; 32];
-        for (o, pair) in out.iter_mut().zip(hex.as_chunks::<2>().0) {
-            let pair = std::str::from_utf8(pair).map_err(|_| BadFingerprint)?;
-            *o = u8::from_str_radix(pair, 16).map_err(|_| BadFingerprint)?;
-        }
-        Ok(Self(out))
+        parse_fingerprint(s).map(Self).ok_or(BadFingerprint)
     }
 }
 
 impl fmt::Display for Fingerprint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (i, b) in self.0.iter().enumerate() {
-            if i > 0 {
-                f.write_str(":")?;
-            }
-            write!(f, "{b:02X}")?;
-        }
-        Ok(())
+        f.write_str(&format_fingerprint(&self.0))
     }
 }
 
@@ -89,16 +72,11 @@ impl ServerCertVerifier for PinnedVerifier {
 
     fn verify_tls12_signature(
         &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.provider.signature_verification_algorithms,
-        )
+        Err(rustls::Error::General("TLS 1.2 is not supported".into()))
     }
 
     fn verify_tls13_signature(
@@ -125,8 +103,8 @@ impl ServerCertVerifier for PinnedVerifier {
 pub fn client_config(pin: Fingerprint) -> Arc<rustls::ClientConfig> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let config = rustls::ClientConfig::builder_with_provider(provider.clone())
-        .with_safe_default_protocol_versions()
-        .expect("ring supports the default protocol versions")
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("ring supports TLS 1.3")
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(PinnedVerifier { pin, provider }))
         .with_no_client_auth();
@@ -145,14 +123,7 @@ mod tests {
         assert_eq!(Fingerprint::parse(&colon), Ok(fp));
         assert_eq!(Fingerprint::parse(&colon.to_lowercase()), Ok(fp));
         assert_eq!(Fingerprint::parse(&"ab".repeat(32)), Ok(fp));
-        assert_eq!(
-            Fingerprint::parse(&format!("sha256:{}", "AB".repeat(32))),
-            Ok(fp)
-        );
-        assert_eq!(
-            Fingerprint::parse(&format!("sha256 Fingerprint={colon}")),
-            Ok(fp)
-        );
+        assert_eq!(Fingerprint::parse(&format!("sha256:{colon}")), Ok(fp));
         assert_eq!(Fingerprint::parse("abcd"), Err(BadFingerprint));
         assert_eq!(Fingerprint::parse(&"zz".repeat(32)), Err(BadFingerprint));
     }

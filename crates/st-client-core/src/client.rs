@@ -476,8 +476,7 @@ impl Actor {
         .map_err(|_| SessionError::Timeout)?
         .map_err(|e| SessionError::Connect(addr, e))?;
         let _ = tcp.set_nodelay(true);
-        let name = ServerName::try_from(self.config.host.clone())
-            .unwrap_or_else(|_| ServerName::try_from("st-server").expect("valid name"));
+        let name = ServerName::try_from(tls::SERVER_NAME).expect("valid name");
         let connector = TlsConnector::from(tls::client_config(self.config.fingerprint));
         let tls = tokio::time::timeout(HELLO_TIMEOUT, connector.connect(name, tcp))
             .await
