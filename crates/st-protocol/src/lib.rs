@@ -15,6 +15,7 @@
 
 mod bitfield;
 mod codec;
+mod fingerprint;
 mod messages;
 
 pub use bitfield::Bitfield;
@@ -22,6 +23,7 @@ pub use codec::{
     client_framed, server_framed, ClientCodec, MessageCodec, ProtocolError, ServerCodec,
     MAX_FRAME_LEN,
 };
+pub use fingerprint::{cert_fingerprint, format_fingerprint, parse_fingerprint};
 pub use messages::{
     ClientMessage, ErrorCode, ServerMessage, TorrentId, TorrentState, PROTOCOL_VERSION,
 };

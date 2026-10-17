@@ -13,6 +13,7 @@ serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 futures.workspace = true
