@@ -1,0 +1,36 @@
+[Unit]
+Description=split-torrent server (BitTorrent to RAM, streamed to st-client over TLS)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/st-server --config /etc/st-server.toml
+Restart=on-failure
+RestartSec=5
+
+DynamicUser=yes
+StateDirectory=st-server
+StateDirectoryMode=0700
+Environment=RUST_LOG=info,librqbit=warn,librqbit_dht=warn
+
+# Torrent data lives only in RAM; the only writable path is the state dir
+# (TLS certificate, key and generated token).
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+# Hard ceiling for a 1 GB machine: buffer_limit (384 MiB) plus librqbit and
+# runtime overhead.
+MemoryMax=640M
+
+[Install]
+WantedBy=multi-user.target
