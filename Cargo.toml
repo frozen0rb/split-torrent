@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = ["crates/st-protocol"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/frozen0rb/split-torrent"
+
+[workspace.dependencies]
+st-protocol = { path = "crates/st-protocol" }
+anyhow = "1"
+bytes = { version = "1", features = ["serde"] }
+futures = "0.3"
+postcard = { version = "1", features = ["use-std"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }

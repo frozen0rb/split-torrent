@@ -1,0 +1,18 @@
+[package]
+name = "st-protocol"
+description = "Wire protocol shared by st-server and st-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bytes.workspace = true
+postcard.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+futures.workspace = true
