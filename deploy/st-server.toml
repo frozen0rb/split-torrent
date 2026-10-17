@@ -1,0 +1,40 @@
+# st-server configuration. Every key is optional; defaults are shown.
+
+# Address st-client connects to (TLS).
+listen = "0.0.0.0:7443"
+
+# Shared secret the client must send. If unset, a random token is generated
+# on first start and stored in <state_dir>/token. Print it with:
+#   st-server --config /etc/st-server.toml show
+# token = "at-least-16-characters"
+
+# TLS certificate/key and generated token. Torrent data is never written to disk.
+state_dir = "/var/lib/st-server"
+
+# RAM for partially downloaded pieces plus pieces waiting for the client's ACK.
+# When it fills up, downloading from the swarm is throttled and then paused
+# until the client acknowledges pieces.
+buffer_limit = "384MiB"
+
+# Swarm downloads are throttled while this many pieces are partially downloaded.
+max_inflight_pieces = 32
+
+# BitTorrent (TCP) listen port for incoming peers; open it in the firewall.
+bt_port = 4240
+
+dht = true
+lsd = true
+upnp = false
+trackers = true
+
+# Serve pieces that are still in RAM to other peers.
+seed = true
+
+peer_limit = 64
+
+# Swarm rate limits in bytes per second (e.g. "10MiB"); 0 = unlimited.
+download_limit = 0
+upload_limit = 0
+
+# Extra peers to try for every torrent.
+initial_peers = []

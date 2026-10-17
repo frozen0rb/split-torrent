@@ -1,0 +1,30 @@
+[package]
+name = "st-server"
+description = "Split-torrent server: downloads via BitTorrent into RAM and streams verified pieces over TLS"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+st-protocol.workspace = true
+anyhow.workspace = true
+bytes.workspace = true
+futures.workspace = true
+serde.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+librqbit = { version = "9.0.1", default-features = false, features = ["rust-tls", "disable-upload"] }
+librqbit-core = { version = "9.0.1", default-features = false }
+clap = { version = "4", features = ["derive", "env"] }
+parking_lot = "0.12"
+rand = "0.9"
+rcgen = "0.13"
+toml = "0.9"
+
+[dev-dependencies]
+tempfile.workspace = true
