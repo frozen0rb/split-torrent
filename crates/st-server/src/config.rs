@@ -44,6 +44,9 @@ pub struct Config {
     pub upload_limit: u64,
     /// Peers to connect to for every torrent, in addition to DHT/trackers.
     pub initial_peers: Vec<SocketAddr>,
+    /// Use IPv6 for BitTorrent in addition to IPv4. Unset = detect at startup
+    /// (off when the host has no IPv6 stack).
+    pub ipv6: Option<bool>,
 }
 
 impl Default for Config {
@@ -64,6 +67,7 @@ impl Default for Config {
             download_limit: 0,
             upload_limit: 0,
             initial_peers: Vec::new(),
+            ipv6: None,
         }
     }
 }
@@ -165,6 +169,7 @@ mod tests {
             download_limit = 1048576
             dht = false
             initial_peers = ["127.0.0.1:6881"]
+            ipv6 = false
             "#,
         )
         .unwrap();
@@ -172,6 +177,8 @@ mod tests {
         assert_eq!(c.download_limit, 1 << 20);
         assert!(!c.dht);
         assert_eq!(c.initial_peers.len(), 1);
+        assert_eq!(c.ipv6, Some(false));
+        assert_eq!(Config::default().ipv6, None);
 
         assert!(Config::from_toml("buffer_limit = \"1MiB\"").is_err());
         assert!(Config::from_toml("token = \"short\"").is_err());

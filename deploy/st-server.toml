@@ -38,3 +38,7 @@ upload_limit = 0
 
 # Extra peers to try for every torrent.
 initial_peers = []
+
+# BitTorrent over IPv6 as well as IPv4. Unset = detect at startup: hosts
+# without an IPv6 stack (ipv6.disable=1, OpenVZ/LXC) use IPv4 only.
+# ipv6 = false
