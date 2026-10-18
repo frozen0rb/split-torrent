@@ -548,11 +548,11 @@ async fn drain_until_finished(
                     .unwrap();
                 }
                 ServerMessage::Status {
-                    state,
+                    state: TorrentState::Finished,
                     pieces_total,
                     pieces_done,
                     ..
-                } if state == TorrentState::Finished => {
+                } => {
                     assert_eq!((pieces_done, pieces_total), (want, want));
                     return;
                 }
