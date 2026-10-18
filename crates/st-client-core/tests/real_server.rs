@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use librqbit::{AddTorrent, AddTorrentOptions, CreateTorrentOptions, Session, SessionOptions};
 use st_client_core::testkit::pseudo_random;
-use st_client_core::{Client, ClientConfig, ConnectionState, Event, Metainfo, TorrentSnapshot};
+use st_client_core::{
+    Client, ClientConfig, ConnectionState, Event, Metainfo, StateConfig, TorrentSnapshot,
+};
 use st_server::{Config, Server};
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -214,12 +216,13 @@ async fn downloads_from_real_server_and_resumes_after_restart() {
     let server = Server::bind(server_config(tmp.path(), &seed))
         .await
         .unwrap();
-    let config = ClientConfig::new(
+    let mut config = ClientConfig::new(
         &server.local_addr().to_string(),
         server.token(),
         server.fingerprint(),
     )
     .unwrap();
+    config.state = StateConfig::new(tmp.path().join("client-state"));
     let state_dir = tmp.path().join("server-state");
     let server = server.spawn();
     let dl = tmp.path().join("downloads");
@@ -302,12 +305,13 @@ async fn downloads_selected_files_and_changes_selection_mid_download() {
     // Slow enough to change the selection while c.bin is downloading.
     cfg.download_limit = 1 << 20;
     let server = Server::bind(cfg).await.unwrap();
-    let config = ClientConfig::new(
+    let mut config = ClientConfig::new(
         &server.local_addr().to_string(),
         server.token(),
         server.fingerprint(),
     )
     .unwrap();
+    config.state = StateConfig::new(tmp.path().join("client-state"));
     let state_dir = tmp.path().join("server-state");
     let server = server.spawn();
     let dl = tmp.path().join("downloads");

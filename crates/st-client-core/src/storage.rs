@@ -1,6 +1,7 @@
 //! Writes verified pieces into pre-allocated files and keeps the resume
-//! bitfield and the file selection in a `.st-state` file next to the
-//! download.
+//! bitfield and the file selection in a `.st-state` file in the client's
+//! state folder (see [`state_path`]). Older versions kept it next to the
+//! download as `<name>.st-state`; such files are migrated on open.
 //!
 //! Only selected files are created and written. A piece that also covers an
 //! unselected file is still verified as a whole, and counts as present once
@@ -13,11 +14,13 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use sha1::{Digest, Sha1};
 use st_protocol::Bitfield;
 
-use crate::metainfo::{InfoHash, Metainfo};
+use crate::metainfo::{hex, InfoHash, Metainfo};
+use crate::persist::{self, FileOps, RealFs, Replaced, SavePolicy};
 
 const STATE_MAGIC_V1: &[u8; 8] = b"STSTATE1";
 const STATE_MAGIC: &[u8; 8] = b"STSTATE2";
@@ -32,23 +35,87 @@ pub enum StorageError {
     HashMismatch(u32),
     #[error("file selection has {got} entries, torrent has {want} files")]
     BadSelection { got: usize, want: usize },
-    #[error("{path}: {source}")]
+    #[error("{op}: {}: {source}", path.display())]
     Io {
+        op: &'static str,
         path: PathBuf,
         #[source]
         source: io::Error,
     },
 }
 
-fn io_err(path: &Path) -> impl FnOnce(io::Error) -> StorageError + '_ {
+fn io_err<'a>(op: &'static str, path: &'a Path) -> impl FnOnce(io::Error) -> StorageError + 'a {
     move |source| StorageError::Io {
+        op,
         path: path.to_owned(),
         source,
     }
 }
 
-/// Path of the state file for a torrent downloaded into `download_dir`.
-pub fn state_path(download_dir: &Path, meta: &Metainfo) -> PathBuf {
+/// Where and how resume state is saved.
+#[derive(Debug, Clone)]
+pub struct StateConfig {
+    pub state_dir: PathBuf,
+    pub ops: Arc<dyn FileOps>,
+    pub policy: SavePolicy,
+}
+
+impl StateConfig {
+    pub fn new(state_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            state_dir: state_dir.into(),
+            ops: Arc::new(RealFs),
+            policy: SavePolicy::default(),
+        }
+    }
+}
+
+/// The per-user folder for resume state: `%APPDATA%\\split-torrent\\data\\state`
+/// on Windows, `~/Library/Application Support/split-torrent/state` on macOS,
+/// `$XDG_DATA_HOME/split-torrent/state` (default `~/.local/share/…`)
+/// elsewhere. Matches the GUI's settings folder.
+pub fn default_state_dir() -> PathBuf {
+    let env = |k| {
+        std::env::var_os(k)
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+    };
+    let home = env("HOME").or_else(|| env("USERPROFILE"));
+    let base = if cfg!(windows) {
+        env("APPDATA").map(|p| p.join("split-torrent").join("data"))
+    } else if cfg!(target_os = "macos") {
+        home.map(|h| h.join("Library/Application Support/split-torrent"))
+    } else {
+        env("XDG_DATA_HOME")
+            .or_else(|| home.map(|h| h.join(".local/share")))
+            .map(|p| p.join("split-torrent"))
+    };
+    base.unwrap_or_else(|| std::env::temp_dir().join("split-torrent"))
+        .join("state")
+}
+
+/// `<state_dir>/<info-hash hex>-<download dir key>.st-state`. The key (8 hex
+/// digits of the SHA-1 of the absolute download folder, case-folded on
+/// Windows) keeps state for the same torrent in different folders apart.
+pub fn state_path(state_dir: &Path, download_dir: &Path, meta: &Metainfo) -> PathBuf {
+    let dir = std::path::absolute(download_dir).unwrap_or_else(|_| download_dir.to_owned());
+    let mut dir = dir.to_string_lossy().into_owned();
+    while dir.len() > 1 && dir.ends_with(['/', '\\']) {
+        dir.pop();
+    }
+    if cfg!(windows) {
+        dir = dir.to_lowercase();
+    }
+    let key = Sha1::digest(dir.as_bytes());
+    state_dir.join(format!(
+        "{}-{}.st-state",
+        hex(&meta.info_hash),
+        hex(&key[..4])
+    ))
+}
+
+/// Where versions before 0.2 kept the state: next to the download.
+pub fn legacy_state_path(download_dir: &Path, meta: &Metainfo) -> PathBuf {
     download_dir.join(format!("{}.st-state", meta.name))
 }
 
@@ -78,6 +145,21 @@ pub struct Storage {
     have: Bitfield,
     progress: Progress,
     state_dirty: bool,
+    state: StateConfig,
+    state_path: PathBuf,
+    /// A valid legacy state file to delete once the new one is saved.
+    legacy_state: Option<PathBuf>,
+    save: SaveStatus,
+}
+
+/// Failures to save the state since the last successful save.
+#[derive(Debug, Default)]
+struct SaveStatus {
+    failures: u32,
+    unsaved_since: Option<Instant>,
+    next_try: Option<Instant>,
+    problem: Option<String>,
+    notice: Option<String>,
 }
 
 impl Storage {
@@ -85,13 +167,22 @@ impl Storage {
     /// loads the bitfield from `.st-state`. `selected` has one entry per
     /// torrent file; `None` keeps the selection saved in `.st-state` (or
     /// selects everything). Padding files are never selected.
+    ///
+    /// Failing to save the state is not an error here or in
+    /// [`Storage::flush`]: it is retried later, see [`Storage::state_saved`].
     pub fn open(
         meta: Arc<Metainfo>,
         download_dir: &Path,
+        state: &StateConfig,
         selected: Option<&[bool]>,
     ) -> Result<Self, StorageError> {
         let n = meta.files.len();
-        let (have, saved) = load_state(&state_path(download_dir, &meta), &meta)
+        let state_path = state_path(&state.state_dir, download_dir, &meta);
+        let legacy = legacy_state_path(download_dir, &meta);
+        let legacy_loaded = load_state(&legacy, &meta);
+        let legacy_state = legacy_loaded.is_some().then_some(legacy);
+        let (have, saved) = load_state(&state_path, &meta)
+            .or(legacy_loaded)
             .unwrap_or_else(|| (Bitfield::new(meta.piece_count()), vec![true; n]));
         let want = match selected {
             Some(s) if s.len() != n => {
@@ -111,6 +202,10 @@ impl Storage {
             have,
             progress: Progress::default(),
             state_dirty: true,
+            state: state.clone(),
+            state_path,
+            legacy_state,
+            save: SaveStatus::default(),
             download_dir: download_dir.to_owned(),
             meta,
         };
@@ -133,6 +228,30 @@ impl Storage {
 
     pub fn download_dir(&self) -> &Path {
         &self.download_dir
+    }
+
+    pub fn state_path(&self) -> &Path {
+        &self.state_path
+    }
+
+    /// Everything written so far is recorded in the state file.
+    pub fn state_saved(&self) -> bool {
+        !self.state_dirty
+    }
+
+    /// Why the state could not be saved, while it is unsaved.
+    pub fn state_problem(&self) -> Option<&str> {
+        self.save.problem.as_deref()
+    }
+
+    /// When saving first failed since the last successful save.
+    pub fn unsaved_since(&self) -> Option<Instant> {
+        self.save.unsaved_since
+    }
+
+    /// A one-off note about a save that worked only via the fallback.
+    pub fn take_notice(&mut self) -> Option<String> {
+        self.save.notice.take()
     }
 
     pub fn have(&self) -> &Bitfield {
@@ -209,7 +328,7 @@ impl Storage {
         let f = &self.meta.files[i];
         let path = self.download_dir.join(self.meta.file_path(f));
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(io_err(parent))?;
+            fs::create_dir_all(parent).map_err(io_err("creating folder", parent))?;
         }
         let existing = fs::metadata(&path)
             .ok()
@@ -221,9 +340,10 @@ impl Storage {
             .create(true)
             .truncate(false)
             .open(&path)
-            .map_err(io_err(&path))?;
+            .map_err(io_err("opening file", &path))?;
         if existing != Some(f.length) {
-            file.set_len(f.length).map_err(io_err(&path))?;
+            file.set_len(f.length)
+                .map_err(io_err("allocating file", &path))?;
             for p in self.meta.pieces_of_file(i) {
                 self.have.set(p, false);
             }
@@ -312,7 +432,7 @@ impl Storage {
             };
             file.seek(SeekFrom::Start(file_off))
                 .and_then(|_| file.write_all(&data[piece_off..piece_off + len]))
-                .map_err(|e| io_err(&path())(e))?;
+                .map_err(|e| io_err("writing piece", &path())(e))?;
             self.dirty[fi] = true;
         }
         self.have.set(index, true);
@@ -343,13 +463,14 @@ impl Storage {
                 .join(self.meta.file_path(&self.meta.files[fi]));
             file.seek(SeekFrom::Start(file_off))
                 .and_then(|_| file.read_exact(&mut buf[piece_off..piece_off + len]))
-                .map_err(io_err(&path))?;
+                .map_err(io_err("reading piece", &path))?;
         }
         Ok(buf)
     }
 
-    /// Syncs written data, then atomically persists the bitfield and the
-    /// selection.
+    /// Syncs written data, then persists the bitfield and the selection.
+    /// Only syncing errors are returned; a failed state save is recorded and
+    /// retried on a later call (with backoff), see [`Storage::state_saved`].
     pub fn flush(&mut self) -> Result<(), StorageError> {
         for (i, dirty) in self.dirty.iter_mut().enumerate() {
             if *dirty {
@@ -357,18 +478,65 @@ impl Storage {
                     let path = self
                         .download_dir
                         .join(self.meta.file_path(&self.meta.files[i]));
-                    f.sync_data().map_err(io_err(&path))?;
+                    f.sync_data()
+                        .map_err(io_err("saving downloaded data (sync)", &path))?;
                 }
                 *dirty = false;
             }
         }
-        if self.state_dirty {
-            let path = state_path(&self.download_dir, &self.meta);
-            save_state(&path, &self.meta.info_hash, &self.have, &self.selected)
-                .map_err(io_err(&path))?;
-            self.state_dirty = false;
+        if self.state_dirty && self.save.next_try.is_none_or(|t| Instant::now() >= t) {
+            self.save_state();
         }
         Ok(())
+    }
+
+    fn save_state(&mut self) {
+        let data = encode_state(&self.meta.info_hash, &self.have, &self.selected);
+        let res = fs::create_dir_all(&self.state.state_dir)
+            .map_err(|e| {
+                format!(
+                    "saving progress (create state folder): {}: {e}",
+                    self.state.state_dir.display()
+                )
+            })
+            .and_then(|()| {
+                persist::replace_file(
+                    &*self.state.ops,
+                    &self.state.policy,
+                    &self.state_path,
+                    &data,
+                    "saving progress",
+                )
+                .map_err(|e| e.to_string())
+            });
+        match res {
+            Ok(r) => {
+                if let Replaced::Overwritten { rename_error } = r {
+                    self.save.notice = Some(format!(
+                        "saved progress by overwriting {} in place (replacing it failed: {rename_error})",
+                        self.state_path.display()
+                    ));
+                }
+                self.state_dirty = false;
+                self.save = SaveStatus {
+                    notice: self.save.notice.take(),
+                    ..SaveStatus::default()
+                };
+                if let Some(legacy) = self.legacy_state.take() {
+                    let _ = fs::remove_file(&legacy);
+                    let mut tmp = legacy.into_os_string();
+                    tmp.push(".tmp");
+                    let _ = fs::remove_file(tmp);
+                }
+            }
+            Err(problem) => {
+                let now = Instant::now();
+                self.save.failures += 1;
+                self.save.unsaved_since.get_or_insert(now);
+                self.save.next_try = Some(now + self.state.policy.retry_after(self.save.failures));
+                self.save.problem = Some(problem);
+            }
+        }
     }
 
     /// Closes and deletes the downloaded files (selected or not) and the
@@ -378,21 +546,26 @@ impl Storage {
             meta,
             download_dir,
             files,
+            state_path,
+            legacy_state,
             ..
         } = self;
         drop(files);
         for f in meta.files.iter().filter(|f| !f.pad) {
             let path = download_dir.join(meta.file_path(f));
             match fs::remove_file(&path) {
-                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(io_err(&path)(e)),
+                Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                    return Err(io_err("deleting file", &path)(e))
+                }
                 _ => {}
             }
         }
         if !meta.single_file {
             remove_empty_dirs(&download_dir.join(&meta.name));
         }
-        let state = state_path(&download_dir, &meta);
-        let _ = fs::remove_file(state);
+        for p in std::iter::once(state_path).chain(legacy_state) {
+            let _ = fs::remove_file(&p);
+        }
         Ok(())
     }
 }
@@ -438,12 +611,7 @@ fn load_state(path: &Path, meta: &Metainfo) -> Option<(Bitfield, Vec<bool>)> {
     Some((have, (0..fc).map(|i| sel.get(i)).collect()))
 }
 
-fn save_state(
-    path: &Path,
-    info_hash: &InfoHash,
-    have: &Bitfield,
-    selected: &[bool],
-) -> io::Result<()> {
+fn encode_state(info_hash: &InfoHash, have: &Bitfield, selected: &[bool]) -> Vec<u8> {
     let mut sel = Bitfield::new(selected.len() as u32);
     for (i, _) in selected.iter().enumerate().filter(|(_, &s)| s) {
         sel.set(i as u32, true);
@@ -455,21 +623,20 @@ fn save_state(
     buf.extend_from_slice(have.as_bytes());
     buf.extend_from_slice(&sel.len().to_le_bytes());
     buf.extend_from_slice(sel.as_bytes());
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
-    {
-        let mut f = File::create(&tmp)?;
-        f.write_all(&buf)?;
-        f.sync_all()?;
-    }
-    fs::rename(&tmp, path)
+    buf
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::persist::tests::{fast_policy, DenyRename};
     use crate::testkit::{make_torrent, pseudo_random};
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    fn st(tmp: &tempfile::TempDir) -> StateConfig {
+        StateConfig::new(tmp.path().join("state"))
+    }
 
     fn setup(piece_len: u32) -> (Arc<Metainfo>, Vec<Vec<u8>>, Vec<Vec<u8>>) {
         let a = pseudo_random(10, 1);
@@ -485,7 +652,7 @@ mod tests {
     fn writes_pieces_across_files_in_any_order() {
         let tmp = tempfile::tempdir().unwrap();
         let (meta, pieces, data) = setup(16);
-        let mut s = Storage::open(meta.clone(), tmp.path(), None).unwrap();
+        let mut s = Storage::open(meta.clone(), tmp.path(), &st(&tmp), None).unwrap();
         let root = tmp.path().join("multi");
         assert_eq!(fs::metadata(root.join("dir/a.bin")).unwrap().len(), 10);
         assert_eq!(fs::metadata(root.join("empty")).unwrap().len(), 0);
@@ -507,7 +674,7 @@ mod tests {
     fn rejects_bad_pieces() {
         let tmp = tempfile::tempdir().unwrap();
         let (meta, pieces, _) = setup(16);
-        let mut s = Storage::open(meta, tmp.path(), None).unwrap();
+        let mut s = Storage::open(meta, tmp.path(), &st(&tmp), None).unwrap();
         let mut bad = pieces[0].clone();
         bad[0] ^= 1;
         assert!(matches!(
@@ -530,43 +697,43 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (meta, pieces, _) = setup(16);
         {
-            let mut s = Storage::open(meta.clone(), tmp.path(), None).unwrap();
+            let mut s = Storage::open(meta.clone(), tmp.path(), &st(&tmp), None).unwrap();
             s.write_piece(1, &pieces[1]).unwrap();
             s.write_piece(3, &pieces[3]).unwrap();
             s.flush().unwrap();
         }
-        assert!(state_path(tmp.path(), &meta).exists());
-        let s = Storage::open(meta.clone(), tmp.path(), None).unwrap();
+        assert!(state_path(&st(&tmp).state_dir, tmp.path(), &meta).exists());
+        let s = Storage::open(meta.clone(), tmp.path(), &st(&tmp), None).unwrap();
         assert_eq!(s.have().iter_ones().collect::<Vec<_>>(), vec![1, 3]);
         drop(s);
 
         // Unflushed state is not persisted.
         {
-            let mut s = Storage::open(meta.clone(), tmp.path(), None).unwrap();
+            let mut s = Storage::open(meta.clone(), tmp.path(), &st(&tmp), None).unwrap();
             s.write_piece(0, &pieces[0]).unwrap();
             std::mem::forget(s);
         }
-        let s = Storage::open(meta.clone(), tmp.path(), None).unwrap();
+        let s = Storage::open(meta.clone(), tmp.path(), &st(&tmp), None).unwrap();
         assert_eq!(s.have().iter_ones().collect::<Vec<_>>(), vec![1, 3]);
         drop(s);
 
         // A file that was truncated invalidates the pieces touching it.
         fs::write(tmp.path().join("multi/dir/a.bin"), b"short").unwrap();
-        let s = Storage::open(meta.clone(), tmp.path(), None).unwrap();
+        let s = Storage::open(meta.clone(), tmp.path(), &st(&tmp), None).unwrap();
         assert_eq!(s.have().iter_ones().collect::<Vec<_>>(), vec![1, 3]);
         drop(s);
         fs::remove_file(tmp.path().join("multi/c.bin")).unwrap();
-        let s = Storage::open(meta.clone(), tmp.path(), None).unwrap();
+        let s = Storage::open(meta.clone(), tmp.path(), &st(&tmp), None).unwrap();
         assert_eq!(s.have().count_ones(), 0);
 
         // A state file for another torrent is ignored.
         let (other, _) = make_torrent("multi", &[("x", &[1; 5])], 16);
         let other = Arc::new(Metainfo::parse(&other).unwrap());
-        assert!(load_state(&state_path(tmp.path(), &other), &other).is_none());
+        assert!(load_state(&state_path(&st(&tmp).state_dir, tmp.path(), &other), &other).is_none());
 
         s.delete_files().unwrap();
         assert!(!tmp.path().join("multi").exists());
-        assert!(!state_path(tmp.path(), &meta).exists());
+        assert!(!state_path(&st(&tmp).state_dir, tmp.path(), &meta).exists());
     }
 
     #[test]
@@ -574,7 +741,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (meta, pieces, data) = setup(16);
         let root = tmp.path().join("multi");
-        let mut s = Storage::open(meta.clone(), tmp.path(), Some(&[true, false, false])).unwrap();
+        let mut s = Storage::open(
+            meta.clone(),
+            tmp.path(),
+            &st(&tmp),
+            Some(&[true, false, false]),
+        )
+        .unwrap();
         assert!(root.join("dir/a.bin").exists());
         assert!(!root.join("c.bin").exists());
         assert!(!root.join("empty").exists());
@@ -594,7 +767,7 @@ mod tests {
         drop(s);
 
         // Reopening keeps the saved selection.
-        let mut s = Storage::open(meta.clone(), tmp.path(), None).unwrap();
+        let mut s = Storage::open(meta.clone(), tmp.path(), &st(&tmp), None).unwrap();
         assert_eq!(s.selected(), &[true, false, false]);
         assert_eq!(s.have().iter_ones().collect::<Vec<_>>(), vec![0]);
 
@@ -617,7 +790,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (meta, pieces, data) = setup(16);
         let root = tmp.path().join("multi");
-        let mut s = Storage::open(meta.clone(), tmp.path(), None).unwrap();
+        let mut s = Storage::open(meta.clone(), tmp.path(), &st(&tmp), None).unwrap();
         for i in 0..4 {
             s.write_piece(i, &pieces[i as usize]).unwrap();
         }
@@ -626,7 +799,7 @@ mod tests {
         assert_eq!(s.progress().bytes_wanted, 45);
         assert_eq!(fs::read(root.join("dir/a.bin")).unwrap(), data[0]);
         drop(s);
-        let mut s = Storage::open(meta.clone(), tmp.path(), None).unwrap();
+        let mut s = Storage::open(meta.clone(), tmp.path(), &st(&tmp), None).unwrap();
         assert_eq!(s.selected(), &[false, false, true]);
         assert!(s.have().is_full());
         // a.bin was not selected when piece 0 was last confirmed: refetch it.
@@ -643,7 +816,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (meta, pieces, _) = setup(16);
         {
-            let mut s = Storage::open(meta.clone(), tmp.path(), None).unwrap();
+            let mut s = Storage::open(meta.clone(), tmp.path(), &st(&tmp), None).unwrap();
             s.write_piece(2, &pieces[2]).unwrap();
             s.flush().unwrap();
         }
@@ -653,8 +826,8 @@ mod tests {
         v1.extend_from_slice(&meta.info_hash);
         v1.extend_from_slice(&4u32.to_le_bytes());
         v1.extend_from_slice(have.as_bytes());
-        fs::write(state_path(tmp.path(), &meta), v1).unwrap();
-        let s = Storage::open(meta, tmp.path(), None).unwrap();
+        fs::write(state_path(&st(&tmp).state_dir, tmp.path(), &meta), v1).unwrap();
+        let s = Storage::open(meta, tmp.path(), &st(&tmp), None).unwrap();
         assert_eq!(s.selected(), &[true, true, true]);
         assert_eq!(s.have().iter_ones().collect::<Vec<_>>(), vec![2]);
     }
@@ -665,12 +838,143 @@ mod tests {
         let data = pseudo_random(100, 9);
         let (bytes, pieces) = make_torrent("file.iso", &[("file.iso", &data)], 32);
         let meta = Arc::new(Metainfo::parse(&bytes).unwrap());
-        let mut s = Storage::open(meta, tmp.path(), None).unwrap();
+        let mut s = Storage::open(meta.clone(), tmp.path(), &st(&tmp), None).unwrap();
         for (i, p) in pieces.iter().enumerate().rev() {
             s.write_piece(i as u32, p).unwrap();
         }
         s.flush().unwrap();
         assert_eq!(fs::read(tmp.path().join("file.iso")).unwrap(), data);
-        assert!(tmp.path().join("file.iso.st-state").exists());
+        assert!(!tmp.path().join("file.iso.st-state").exists());
+        assert!(state_path(&st(&tmp).state_dir, tmp.path(), &meta).exists());
+    }
+
+    #[test]
+    fn state_lives_in_state_dir_keyed_by_download_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (meta, _, _) = setup(16);
+        let sd = tmp.path().join("state");
+        let a = state_path(&sd, &tmp.path().join("a"), &meta);
+        assert_eq!(a.parent().unwrap(), sd);
+        let name = a.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name.starts_with(&crate::metainfo::hex(&meta.info_hash)),
+            "{name}"
+        );
+        assert!(name.ends_with(".st-state"));
+        assert_ne!(a, state_path(&sd, &tmp.path().join("b"), &meta));
+        assert_eq!(a, state_path(&sd, &tmp.path().join("a/"), &meta));
+    }
+
+    #[test]
+    fn migrates_legacy_state_next_to_download() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (meta, pieces, _) = setup(16);
+        let legacy = legacy_state_path(tmp.path(), &meta);
+        {
+            let mut s = Storage::open(meta.clone(), tmp.path(), &st(&tmp), None).unwrap();
+            s.write_piece(1, &pieces[1]).unwrap();
+            s.flush().unwrap();
+            // Pretend an older version wrote it next to the download.
+            fs::rename(s.state_path(), &legacy).unwrap();
+        }
+        fs::write(legacy.with_extension("st-state.tmp"), b"junk").unwrap();
+        let mut s = Storage::open(meta.clone(), tmp.path(), &st(&tmp), None).unwrap();
+        assert_eq!(s.have().iter_ones().collect::<Vec<_>>(), vec![1]);
+        assert!(!legacy.exists(), "legacy state is removed after migration");
+        assert!(!legacy.with_extension("st-state.tmp").exists());
+        assert!(s.state_path().exists());
+        s.write_piece(2, &pieces[2]).unwrap();
+        s.flush().unwrap();
+        drop(s);
+        let s = Storage::open(meta.clone(), tmp.path(), &st(&tmp), None).unwrap();
+        assert_eq!(s.have().iter_ones().collect::<Vec<_>>(), vec![1, 2]);
+
+        // A legacy file of a different torrent with the same name is left alone.
+        drop(s);
+        let (other, _) = make_torrent("multi", &[("x", &[1; 5])], 16);
+        let other = Arc::new(Metainfo::parse(&other).unwrap());
+        let mut o = Storage::open(other, tmp.path(), &st(&tmp), Some(&[false])).unwrap();
+        o.flush().unwrap();
+        fs::copy(o.state_path(), &legacy).unwrap();
+        let s = Storage::open(meta.clone(), tmp.path(), &st(&tmp), None).unwrap();
+        assert!(legacy.exists());
+        assert_eq!(s.have().iter_ones().collect::<Vec<_>>(), vec![1, 2]);
+
+        // Removing with files deletes the state in the state folder.
+        let path = s.state_path().to_owned();
+        s.delete_files().unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn denied_rename_falls_back_to_overwrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (meta, pieces, _) = setup(16);
+        let ops = Arc::new(DenyRename::default());
+        let cfg = StateConfig {
+            ops: ops.clone(),
+            policy: fast_policy(),
+            ..st(&tmp)
+        };
+        let mut s = Storage::open(meta.clone(), tmp.path(), &cfg, None).unwrap();
+        assert!(s.state_saved());
+        assert!(s.take_notice().unwrap().contains("overwriting"));
+        s.write_piece(0, &pieces[0]).unwrap();
+        s.flush().unwrap();
+        assert!(s.state_saved());
+        assert!(s.state_problem().is_none());
+        assert!(ops.renames.load(Ordering::SeqCst) >= 6);
+        drop(s);
+        let s = Storage::open(meta, tmp.path(), &st(&tmp), None).unwrap();
+        assert_eq!(s.have().iter_ones().collect::<Vec<_>>(), vec![0]);
+    }
+
+    #[test]
+    fn failed_saves_are_retried_not_fatal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (meta, pieces, _) = setup(16);
+        let ops = Arc::new(DenyRename {
+            overwrite_failures: 3,
+            ..Default::default()
+        });
+        let cfg = StateConfig {
+            ops: ops.clone(),
+            policy: SavePolicy {
+                retry_min: Duration::from_millis(50),
+                retry_max: Duration::from_millis(50),
+                ..fast_policy()
+            },
+            ..st(&tmp)
+        };
+        // Opening succeeds even though the first save fails.
+        let mut s = Storage::open(meta.clone(), tmp.path(), &cfg, None).unwrap();
+        assert!(!s.state_saved());
+        let problem = s.state_problem().unwrap().to_owned();
+        assert!(
+            problem.starts_with("saving progress (replace "),
+            "{problem}"
+        );
+        assert!(problem.contains(".st-state"), "{problem}");
+        let since = s.unsaved_since().unwrap();
+
+        s.write_piece(0, &pieces[0]).unwrap();
+        // Within the backoff no new attempt is made.
+        s.flush().unwrap();
+        assert_eq!(ops.overwrites.load(Ordering::SeqCst), 1);
+        assert!(!s.state_saved());
+        for _ in 0..2 {
+            std::thread::sleep(Duration::from_millis(60));
+            s.flush().unwrap();
+        }
+        assert_eq!(ops.overwrites.load(Ordering::SeqCst), 3);
+        assert!(!s.state_saved());
+        assert_eq!(s.unsaved_since(), Some(since));
+        std::thread::sleep(Duration::from_millis(60));
+        s.flush().unwrap();
+        assert!(s.state_saved());
+        assert!(s.state_problem().is_none() && s.unsaved_since().is_none());
+        drop(s);
+        let s = Storage::open(meta, tmp.path(), &st(&tmp), None).unwrap();
+        assert_eq!(s.have().iter_ones().collect::<Vec<_>>(), vec![0]);
     }
 }

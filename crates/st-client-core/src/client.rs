@@ -20,7 +20,7 @@ use tokio::sync::mpsc;
 use tokio_rustls::TlsConnector;
 
 use crate::metainfo::{InfoHash, Metainfo, MetainfoError};
-use crate::storage::{Progress, Storage, StorageError};
+use crate::storage::{default_state_dir, Progress, StateConfig, Storage, StorageError};
 use crate::tls::{self, BadFingerprint, Fingerprint};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -55,6 +55,8 @@ pub struct ClientConfig {
     pub token: String,
     pub fingerprint: Fingerprint,
     pub backoff: Backoff,
+    /// Where resume state goes; defaults to [`default_state_dir`].
+    pub state: StateConfig,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -78,6 +80,7 @@ impl ClientConfig {
             token: token.to_owned(),
             fingerprint: Fingerprint::parse(fingerprint)?,
             backoff: Backoff::default(),
+            state: StateConfig::new(default_state_dir()),
         })
     }
 }
@@ -161,6 +164,9 @@ pub struct TorrentSnapshot {
     pub online: bool,
     pub server: Option<ServerStatus>,
     pub error: Option<String>,
+    /// A problem that does not stop the download, e.g. progress that cannot
+    /// be saved right now.
+    pub warning: Option<String>,
 }
 
 impl TorrentSnapshot {
@@ -180,6 +186,7 @@ impl TorrentSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum Event {
     Connection(ConnectionState),
     Torrent(TorrentSnapshot),
@@ -220,6 +227,7 @@ pub type Notify = Arc<dyn Fn() + Send + Sync>;
 pub struct Client {
     cmd: mpsc::UnboundedSender<Command>,
     known: Arc<Mutex<HashSet<InfoHash>>>,
+    state: StateConfig,
 }
 
 impl Client {
@@ -233,6 +241,7 @@ impl Client {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (ev_tx, ev_rx) = mpsc::unbounded_channel();
         let known = Arc::new(Mutex::new(HashSet::new()));
+        let state = config.state.clone();
         let actor = Actor {
             config,
             events: ev_tx,
@@ -243,7 +252,14 @@ impl Client {
             online: false,
         };
         rt.spawn(actor.run(cmd_rx));
-        (Self { cmd: cmd_tx, known }, ev_rx)
+        (
+            Self {
+                cmd: cmd_tx,
+                known,
+                state,
+            },
+            ev_rx,
+        )
     }
 
     /// Parses the torrent, creates/pre-allocates the selected files under
@@ -264,7 +280,7 @@ impl Client {
         if !self.known.lock().unwrap().insert(meta.info_hash) {
             return Err(AddError::Duplicate);
         }
-        let storage = match Storage::open(meta.clone(), download_dir, selected) {
+        let storage = match Storage::open(meta.clone(), download_dir, &self.state, selected) {
             Ok(s) => s,
             Err(e) => {
                 self.known.lock().unwrap().remove(&meta.info_hash);
@@ -323,6 +339,9 @@ struct Torrent {
     add_sent: bool,
     server: Option<ServerStatus>,
     error: Option<String>,
+    warning: Option<String>,
+    /// Pieces are on disk whose state could not be saved yet.
+    state_unsaved: bool,
     selected: Vec<bool>,
     progress: Progress,
     /// The selection changed after `AddTorrent` was sent but before the
@@ -349,6 +368,8 @@ impl Torrent {
             add_sent: false,
             server: None,
             error: None,
+            warning: None,
+            state_unsaved: false,
             recv_bytes: 0,
             recv_speed: 0,
             pending_acks: Vec::new(),
@@ -378,6 +399,7 @@ impl Torrent {
             online: self.server_id.is_some(),
             server: self.server.clone(),
             error: self.error.clone(),
+            warning: self.warning.clone(),
         }
     }
 
@@ -427,6 +449,13 @@ impl SessionError {
 
 /// Outcome of a session that did not fail.
 struct Shutdown;
+
+struct SaveInfo {
+    saved: bool,
+    problem: Option<String>,
+    unsaved_since: Option<Instant>,
+    notice: Option<String>,
+}
 
 struct Actor {
     config: ClientConfig,
@@ -763,12 +792,15 @@ impl Actor {
         }
     }
 
-    /// Makes written pieces durable, then queues their `Ack`s.
+    /// Makes written pieces durable, then queues their `Ack`s. While the
+    /// state cannot be saved the `Ack`s are held (and the save retried) for
+    /// up to `ack_unsaved_after`; then they are sent anyway so the download
+    /// keeps going.
     async fn flush_all(&mut self) {
         let jobs: Vec<_> = self
             .torrents
             .values()
-            .filter(|t| !t.pending_acks.is_empty())
+            .filter(|t| !t.pending_acks.is_empty() || t.state_unsaved)
             .map(|t| (t.meta.info_hash, t.storage.clone()))
             .collect();
         if jobs.is_empty() {
@@ -776,35 +808,83 @@ impl Actor {
         }
         let results = tokio::task::spawn_blocking(move || {
             jobs.into_iter()
-                .map(|(ih, s)| (ih, s.lock().unwrap().flush()))
+                .map(|(ih, s)| {
+                    let mut s = s.lock().unwrap();
+                    let res = s.flush().map(|()| SaveInfo {
+                        saved: s.state_saved(),
+                        problem: s.state_problem().map(str::to_owned),
+                        unsaved_since: s.unsaved_since(),
+                        notice: s.take_notice(),
+                    });
+                    (ih, res)
+                })
                 .collect::<Vec<_>>()
         })
         .await
         .expect("storage task panicked");
+        let grace = self.config.state.policy.ack_unsaved_after;
+        let mut warnings = Vec::new();
         for (ih, res) in results {
             let Some(t) = self.torrents.get_mut(&ih) else {
                 continue;
             };
-            let acks = std::mem::take(&mut t.pending_acks);
-            match (res, t.server_id) {
-                (Ok(()), Some(torrent_id)) => {
-                    self.outbox.extend(
-                        acks.into_iter()
-                            .map(|index| ClientMessage::Ack { torrent_id, index }),
-                    );
-                }
-                (Ok(()), None) => {}
-                (Err(e), id) => {
-                    let text = format!("{}: flush failed, pausing: {e}", t.meta.name);
+            let name = &t.meta.name;
+            let info = match res {
+                Ok(info) => info,
+                Err(e) => {
+                    warnings.push(format!("{name}: writing data failed, pausing: {e}"));
                     t.error = Some(e.to_string());
                     t.paused = true;
                     t.changed = true;
-                    if let Some(torrent_id) = id {
+                    t.pending_acks.clear();
+                    if let Some(torrent_id) = t.server_id {
                         self.outbox.push(ClientMessage::Pause { torrent_id });
                     }
-                    self.emit(Event::Warning(text));
+                    continue;
                 }
+            };
+            if let Some(n) = info.notice {
+                warnings.push(format!("{name}: {n}"));
             }
+            t.state_unsaved = !info.saved;
+            let ack = if info.saved {
+                if t.warning.take().is_some() {
+                    t.changed = true;
+                    warnings.push(format!("{name}: progress is saved again"));
+                }
+                true
+            } else {
+                let problem = info.problem.unwrap_or_else(|| "not saved yet".into());
+                let overdue = info.unsaved_since.is_some_and(|s| s.elapsed() >= grace);
+                let text = if overdue {
+                    format!(
+                        "progress not saved, still retrying (downloaded data is on disk but may be fetched again after a restart): {problem}"
+                    )
+                } else {
+                    format!("could not save progress, retrying: {problem}")
+                };
+                if t.warning.as_ref() != Some(&text) {
+                    if t.warning.is_none() || overdue {
+                        warnings.push(format!("{name}: {text}"));
+                    }
+                    t.warning = Some(text);
+                    t.changed = true;
+                }
+                overdue
+            };
+            if !ack {
+                continue;
+            }
+            let acks = std::mem::take(&mut t.pending_acks);
+            if let Some(torrent_id) = t.server_id {
+                self.outbox.extend(
+                    acks.into_iter()
+                        .map(|index| ClientMessage::Ack { torrent_id, index }),
+                );
+            }
+        }
+        for w in warnings {
+            self.emit(Event::Warning(w));
         }
     }
 
