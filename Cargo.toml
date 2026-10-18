@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/st-protocol", "crates/st-server", "crates/st-client-core", "crates/st-client"]
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.1.0"
@@ -30,3 +31,8 @@ tempfile = "3"
 [profile.release]
 strip = true
 lto = "thin"
+
+# librqbit 9.0.1's UDP tracker client always binds [::]:0, which fails on hosts
+# without an IPv6 stack. The vendored copy falls back to 0.0.0.0:0.
+[patch.crates-io]
+librqbit-tracker-comms = { path = "vendor/librqbit-tracker-comms" }
