@@ -96,8 +96,8 @@ async fn recv(conn: &mut Conn) -> ClientMessage {
         .unwrap()
 }
 
-/// Hello + AddTorrent; returns the `have` bitfield.
-async fn accept_torrent(conn: &mut Conn, meta: &Metainfo, id: u32) -> Bitfield {
+/// Hello + AddTorrent; returns the `have` bitfield and selected files.
+async fn accept_torrent(conn: &mut Conn, meta: &Metainfo, id: u32) -> (Bitfield, Vec<u32>) {
     assert_eq!(
         recv(conn).await,
         ClientMessage::Hello {
@@ -114,6 +114,7 @@ async fn accept_torrent(conn: &mut Conn, meta: &Metainfo, id: u32) -> Bitfield {
     let ClientMessage::AddTorrent {
         torrent_bytes,
         have,
+        files,
     } = recv(conn).await
     else {
         panic!("expected AddTorrent");
@@ -122,6 +123,11 @@ async fn accept_torrent(conn: &mut Conn, meta: &Metainfo, id: u32) -> Bitfield {
         Metainfo::parse(&torrent_bytes).unwrap().info_hash,
         meta.info_hash
     );
+    accept_added(conn, meta, id).await;
+    (have, files)
+}
+
+async fn accept_added(conn: &mut Conn, meta: &Metainfo, id: u32) {
     conn.send(ServerMessage::TorrentAdded {
         torrent_id: id,
         info_hash: meta.info_hash,
@@ -132,7 +138,6 @@ async fn accept_torrent(conn: &mut Conn, meta: &Metainfo, id: u32) -> Bitfield {
     })
     .await
     .unwrap();
-    have
 }
 
 /// Sends `indices` and waits for an `Ack` for each of them.
@@ -230,17 +235,18 @@ async fn downloads_and_resumes_after_disconnect() {
         None,
     );
     let snap = client
-        .add_torrent(f.torrent.clone(), dir.path(), false)
+        .add_torrent(f.torrent.clone(), dir.path(), false, None)
         .unwrap();
     assert_eq!(snap.pieces_have, 0);
     assert!(matches!(
-        client.add_torrent(f.torrent.clone(), dir.path(), false),
+        client.add_torrent(f.torrent.clone(), dir.path(), false, None),
         Err(st_client_core::AddError::Duplicate)
     ));
 
     // First connection: deliver five pieces out of order, then drop.
     let mut conn = mock.next_conn().await;
-    let have = accept_torrent(&mut conn, &f.meta, 7).await;
+    let (have, files) = accept_torrent(&mut conn, &f.meta, 7).await;
+    assert_eq!(files, vec![0, 1, 2]);
     assert_eq!(have.count_ones(), 0);
     send_pieces(&mut conn, 7, &f.pieces, &[8, 0, 4, 5, 2]).await;
     conn.send(ServerMessage::Status {
@@ -269,7 +275,7 @@ async fn downloads_and_resumes_after_disconnect() {
 
     // Reconnect: the client resends AddTorrent with exactly the acked pieces.
     let mut conn = mock.next_conn().await;
-    let have = accept_torrent(&mut conn, &f.meta, 8).await;
+    let (have, _) = accept_torrent(&mut conn, &f.meta, 8).await;
     assert_eq!(have.iter_ones().collect::<Vec<_>>(), vec![0, 2, 4, 5, 8]);
     // A duplicate of a piece the client already has is acked, not rewritten.
     let mut missing: Vec<u32> = have.iter_zeros().collect();
@@ -292,7 +298,7 @@ async fn downloads_and_resumes_after_disconnect() {
         None,
     );
     let snap = client
-        .add_torrent(f.torrent.clone(), dir.path(), false)
+        .add_torrent(f.torrent.clone(), dir.path(), false, None)
         .unwrap();
     assert!(snap.complete());
     let mut conn = mock.next_conn().await;
@@ -325,7 +331,7 @@ async fn corrupt_piece_forces_reconnect_without_ack() {
         None,
     );
     client
-        .add_torrent(f.torrent.clone(), dir.path(), false)
+        .add_torrent(f.torrent.clone(), dir.path(), false, None)
         .unwrap();
     let mut conn = mock.next_conn().await;
     accept_torrent(&mut conn, &f.meta, 1).await;
@@ -350,7 +356,7 @@ async fn corrupt_piece_forces_reconnect_without_ack() {
     ));
 
     let mut conn = mock.next_conn().await;
-    let have = accept_torrent(&mut conn, &f.meta, 1).await;
+    let (have, _) = accept_torrent(&mut conn, &f.meta, 1).await;
     assert_eq!(have.count_ones(), 0);
     let all: Vec<u32> = (0..f.meta.piece_count()).collect();
     send_pieces(&mut conn, 1, &f.pieces, &all).await;
@@ -370,7 +376,7 @@ async fn pause_resume_remove_are_forwarded() {
     );
     // Added paused: the client pauses it right after registration.
     let snap = client
-        .add_torrent(f.torrent.clone(), dir.path(), true)
+        .add_torrent(f.torrent.clone(), dir.path(), true, None)
         .unwrap();
     let mut conn = mock.next_conn().await;
     accept_torrent(&mut conn, &f.meta, 5).await;
@@ -414,12 +420,94 @@ async fn pause_resume_remove_are_forwarded() {
     );
     // It can be added again afterwards.
     client
-        .add_torrent(f.torrent.clone(), dir.path(), false)
+        .add_torrent(f.torrent.clone(), dir.path(), false, None)
         .unwrap();
     assert!(matches!(
         recv(&mut conn).await,
         ClientMessage::AddTorrent { .. }
     ));
+}
+
+#[tokio::test]
+async fn file_selection_is_sent_and_can_change() {
+    let mut mock = mock_server().await;
+    let f = fixture();
+    let dir = tempfile::tempdir().unwrap();
+    let show = dir.path().join("Show");
+    // ep1 = pieces 0..=4, ep2 = 4..=8, readme = 8 (pieces 4 and 8 are shared).
+    assert_eq!(f.meta.pieces_of_file(1), 4..9);
+    let (client, mut rx) = Client::start(
+        mock.config(TOKEN, mock.fingerprint),
+        &tokio::runtime::Handle::current(),
+        None,
+    );
+    assert!(matches!(
+        client.add_torrent(f.torrent.clone(), dir.path(), false, Some(&[false; 3])),
+        Err(st_client_core::AddError::NothingSelected)
+    ));
+    let snap = client
+        .add_torrent(
+            f.torrent.clone(),
+            dir.path(),
+            false,
+            Some(&[true, false, false]),
+        )
+        .unwrap();
+    assert_eq!((snap.pieces_wanted, snap.bytes_wanted), (5, 5000));
+    assert!(show.join("season 1/ep1.mkv").exists());
+    assert!(!show.join("season 1/ep2.mkv").exists());
+    assert!(!show.join("readme.txt").exists());
+
+    let mut conn = mock.next_conn().await;
+    let (have, files) = accept_torrent(&mut conn, &f.meta, 7).await;
+    assert_eq!((have.count_ones(), files), (0, vec![0]));
+    send_pieces(&mut conn, 7, &f.pieces, &[0, 1, 2, 3, 4]).await;
+    wait_event(&mut rx, complete).await;
+    assert_eq!(
+        std::fs::read(show.join("season 1/ep1.mkv")).unwrap(),
+        f.files[0].1
+    );
+    assert!(!show.join("season 1/ep2.mkv").exists());
+
+    // Add ep2: piece 4 is dropped because only its ep1 part was written.
+    client.set_files(snap.info_hash, vec![true, true, false]);
+    let ClientMessage::SetFiles {
+        torrent_id: 7,
+        files,
+        have,
+    } = recv(&mut conn).await
+    else {
+        panic!("expected SetFiles");
+    };
+    assert_eq!(files, vec![0, 1]);
+    assert_eq!(have.iter_ones().collect::<Vec<_>>(), vec![0, 1, 2, 3]);
+    send_pieces(&mut conn, 7, &f.pieces, &[4, 5, 6, 7, 8]).await;
+    let ev = wait_event(&mut rx, complete).await;
+    let Event::Torrent(s) = ev else {
+        unreachable!()
+    };
+    assert_eq!(s.selected, vec![true, true, false]);
+    assert_eq!(s.file_bytes_have[..2], [5000, 3333]);
+    assert_eq!(
+        std::fs::read(show.join("season 1/ep2.mkv")).unwrap(),
+        f.files[1].1
+    );
+    assert!(!show.join("readme.txt").exists());
+
+    // Swap ep1 for the readme: ep1 stays on disk, piece 8 is fetched again.
+    client.set_files(snap.info_hash, vec![false, true, true]);
+    let ClientMessage::SetFiles { files, have, .. } = recv(&mut conn).await else {
+        panic!("expected SetFiles");
+    };
+    assert_eq!(files, vec![1, 2]);
+    assert_eq!(have.iter_zeros().collect::<Vec<_>>(), vec![8]);
+    send_pieces(&mut conn, 7, &f.pieces, &[8]).await;
+    wait_event(
+        &mut rx,
+        |e| matches!(e, Event::Torrent(s) if s.complete() && s.selected[2]),
+    )
+    .await;
+    assert_files(dir.path(), &f);
 }
 
 #[tokio::test]

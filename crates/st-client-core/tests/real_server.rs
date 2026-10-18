@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use librqbit::{AddTorrent, AddTorrentOptions, CreateTorrentOptions, Session, SessionOptions};
 use st_client_core::testkit::pseudo_random;
-use st_client_core::{Client, ClientConfig, ConnectionState, Event, TorrentSnapshot};
+use st_client_core::{Client, ClientConfig, ConnectionState, Event, Metainfo, TorrentSnapshot};
 use st_server::{Config, Server};
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -192,14 +192,11 @@ fn assert_no_payload_on_server_disk(state_dir: &Path, test_dir: &Path, tag: &str
     assert!(!std::env::temp_dir().join(tag).exists());
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn downloads_from_real_server_and_resumes_after_restart() {
-    let tmp = tempfile::tempdir().unwrap();
-    let seed = start_seed(&tmp.path().join("seed")).await;
-    let server = Server::bind(Config {
+fn server_config(tmp: &Path, seed: &Seed) -> Config {
+    Config {
         listen: "127.0.0.1:0".parse().unwrap(),
         token: Some("client-core-test-token".into()),
-        state_dir: tmp.path().join("server-state"),
+        state_dir: tmp.join("server-state"),
         buffer_limit: 16 * 1024 * 1024,
         max_inflight_pieces: 2,
         bt_port: 0,
@@ -208,9 +205,16 @@ async fn downloads_from_real_server_and_resumes_after_restart() {
         trackers: false,
         initial_peers: vec![seed.addr],
         ..Default::default()
-    })
-    .await
-    .unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn downloads_from_real_server_and_resumes_after_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let seed = start_seed(&tmp.path().join("seed")).await;
+    let server = Server::bind(server_config(tmp.path(), &seed))
+        .await
+        .unwrap();
     let config = ClientConfig::new(
         &server.local_addr().to_string(),
         server.token(),
@@ -225,7 +229,7 @@ async fn downloads_from_real_server_and_resumes_after_restart() {
     // First run: stop the client as soon as some pieces are on disk.
     let (client, mut rx) = Client::start(config.clone(), &rt, None);
     let snap = client
-        .add_torrent(seed.torrent.clone(), &dl, false)
+        .add_torrent(seed.torrent.clone(), &dl, false, None)
         .unwrap();
     assert_eq!(snap.piece_count, 26);
     let ev = wait(
@@ -246,20 +250,119 @@ async fn downloads_from_real_server_and_resumes_after_restart() {
     // Second run (like an app restart): resumes from `.st-state`.
     let (client, mut rx) = Client::start(config, &rt, None);
     let snap = client
-        .add_torrent(seed.torrent.clone(), &dl, false)
+        .add_torrent(seed.torrent.clone(), &dl, false, None)
         .unwrap();
     assert!(snap.pieces_have >= first.pieces_have.min(1));
     let ev = wait(&mut rx, |e| matches!(e, Event::Torrent(s) if s.complete())).await;
     let Event::Torrent(TorrentSnapshot {
         bytes_have,
+        bytes_wanted,
         total_length,
         ..
     }) = ev
     else {
         unreachable!()
     };
-    assert_eq!(bytes_have, total_length);
+    assert_eq!((bytes_have, bytes_wanted), (total_length, total_length));
     assert_same_tree(&seed.tag, &seed.data_dir, &dl.join(&seed.tag));
+    assert_no_payload_on_server_disk(&state_dir, tmp.path(), &seed.tag);
+
+    client.shutdown();
+    server.shutdown().await;
+}
+
+fn assert_file(tag: &str, name: &str, want: &Path, got: &Path) {
+    let name = file_name(tag, name);
+    let a = std::fs::read(want.join(&name)).unwrap();
+    let b = std::fs::read(got.join(&name)).unwrap();
+    assert!(a == b, "{name} differs");
+}
+
+/// Waits for a snapshot with exactly `selected` that satisfies `pred`.
+async fn wait_snap(
+    rx: &mut UnboundedReceiver<Event>,
+    selected: &[bool],
+    mut pred: impl FnMut(&TorrentSnapshot) -> bool,
+) -> TorrentSnapshot {
+    let ev = wait(
+        rx,
+        |e| matches!(e, Event::Torrent(s) if s.selected == selected && pred(s)),
+    )
+    .await;
+    let Event::Torrent(s) = ev else {
+        unreachable!()
+    };
+    s
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn downloads_selected_files_and_changes_selection_mid_download() {
+    let tmp = tempfile::tempdir().unwrap();
+    let seed = start_seed(&tmp.path().join("seed")).await;
+    let mut cfg = server_config(tmp.path(), &seed);
+    // Slow enough to change the selection while c.bin is downloading.
+    cfg.download_limit = 1 << 20;
+    let server = Server::bind(cfg).await.unwrap();
+    let config = ClientConfig::new(
+        &server.local_addr().to_string(),
+        server.token(),
+        server.fingerprint(),
+    )
+    .unwrap();
+    let state_dir = tmp.path().join("server-state");
+    let server = server.spawn();
+    let dl = tmp.path().join("downloads");
+    let root = dl.join(&seed.tag);
+    let rt = tokio::runtime::Handle::current();
+
+    let meta = Metainfo::parse(&seed.torrent).unwrap();
+    let index = |name: &str| {
+        let want = std::path::PathBuf::from(file_name(&seed.tag, name));
+        meta.files.iter().position(|f| f.path == want).unwrap()
+    };
+    let (a, b, c) = (index("a.bin"), index("sub/b.bin"), index("sub/c.bin"));
+    let sel = |files: &[usize]| -> Vec<bool> {
+        (0..meta.files.len()).map(|i| files.contains(&i)).collect()
+    };
+    let path = |i: usize| root.join(&meta.files[i].path);
+
+    // Only a.bin: the other files are never created.
+    let (client, mut rx) = Client::start(config, &rt, None);
+    let snap = client
+        .add_torrent(seed.torrent.clone(), &dl, false, Some(&sel(&[a])))
+        .unwrap();
+    assert_eq!(snap.bytes_wanted, FILES[0].1 as u64);
+    let only_a = sel(&[a]);
+    wait_snap(&mut rx, &only_a, |s| s.complete()).await;
+    assert_file(&seed.tag, "a.bin", &seed.data_dir, &root);
+    assert!(!path(b).exists() && !path(c).exists());
+
+    // Add c.bin, then swap it for b.bin while it is still downloading.
+    let a_c = sel(&[a, c]);
+    client.set_files(snap.info_hash, a_c.clone());
+    let a_len = FILES[0].1 as u64;
+    let mid = wait_snap(&mut rx, &a_c, |s| {
+        s.file_bytes_have[c] >= 2 * u64::from(PIECE) && !s.complete()
+    })
+    .await;
+    assert!(mid.bytes_have >= a_len - u64::from(PIECE));
+    let a_b = sel(&[a, b]);
+    client.set_files(snap.info_hash, a_b.clone());
+    let done = wait_snap(&mut rx, &a_b, |s| s.complete()).await;
+    assert_eq!(done.bytes_have, a_len + FILES[1].1 as u64);
+    assert_file(&seed.tag, "a.bin", &seed.data_dir, &root);
+    assert_file(&seed.tag, "sub/b.bin", &seed.data_dir, &root);
+    // c.bin keeps what it had but is not complete.
+    let c_have = done.file_bytes_have[c];
+    assert!(c_have > 0 && c_have < FILES[2].1 as u64, "{c_have}");
+    assert_eq!(std::fs::metadata(path(c)).unwrap().len(), FILES[2].1 as u64);
+
+    // Everything: the rest of c.bin arrives and the tree matches the seed.
+    let all = sel(&[a, b, c]);
+    client.set_files(snap.info_hash, all.clone());
+    let s = wait_snap(&mut rx, &all, |s| s.complete()).await;
+    assert_eq!(s.bytes_have, s.total_length);
+    assert_same_tree(&seed.tag, &seed.data_dir, &root);
     assert_no_payload_on_server_disk(&state_dir, tmp.path(), &seed.tag);
 
     client.shutdown();

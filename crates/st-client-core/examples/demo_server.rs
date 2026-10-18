@@ -111,8 +111,47 @@ struct Active {
     idx: usize,
     queue: Vec<u32>,
     unacked: u64,
-    done: u32,
+    have: Vec<bool>,
+    wanted: Vec<bool>,
     paused: bool,
+}
+
+impl Active {
+    fn new(idx: usize, meta: &Metainfo, have: &st_protocol::Bitfield, files: &[u32]) -> Self {
+        let mut a = Self {
+            idx,
+            queue: Vec::new(),
+            unacked: 0,
+            have: Vec::new(),
+            wanted: Vec::new(),
+            paused: false,
+        };
+        a.select(meta, have, files);
+        a
+    }
+
+    fn select(&mut self, meta: &Metainfo, have: &st_protocol::Bitfield, files: &[u32]) {
+        let n = meta.piece_count();
+        self.have = (0..n).map(|i| have.get(i)).collect();
+        self.wanted = vec![false; n as usize];
+        for &f in files.iter().filter(|&&f| (f as usize) < meta.files.len()) {
+            for p in meta.pieces_of_file(f as usize) {
+                self.wanted[p as usize] = true;
+            }
+        }
+        self.queue = (0..n)
+            .filter(|&i| self.wanted[i as usize] && !self.have[i as usize])
+            .rev()
+            .collect();
+    }
+
+    fn counts(&self) -> (u32, u32) {
+        let total = self.wanted.iter().filter(|&&w| w).count() as u32;
+        let done = (0..self.wanted.len())
+            .filter(|&i| self.wanted[i] && self.have[i])
+            .count() as u32;
+        (done, total)
+    }
 }
 
 async fn serve(
@@ -151,13 +190,11 @@ async fn serve(
             msg = conn.next() => {
                 let Some(Ok(msg)) = msg else { return };
                 match msg {
-                    ClientMessage::AddTorrent { torrent_bytes, have } => {
+                    ClientMessage::AddTorrent { torrent_bytes, have, files } => {
                         let Ok(meta) = Metainfo::parse(&torrent_bytes) else { continue };
                         let Some(idx) = torrents.iter().position(|t| t.meta.info_hash == meta.info_hash) else { continue };
                         let id = idx as u32 + 1;
-                        let queue: Vec<u32> = (0..meta.piece_count()).filter(|&i| !have.get(i)).rev().collect();
-                        let done = meta.piece_count() - queue.len() as u32;
-                        active.insert(id, Active { idx, queue, unacked: 0, done, paused: false });
+                        active.insert(id, Active::new(idx, &meta, &have, &files));
                         let _ = conn.send(ServerMessage::TorrentAdded {
                             torrent_id: id,
                             info_hash: meta.info_hash,
@@ -170,7 +207,14 @@ async fn serve(
                     ClientMessage::Ack { torrent_id, index } => {
                         if let Some(a) = active.get_mut(&torrent_id) {
                             a.unacked = a.unacked.saturating_sub(torrents[a.idx].pieces[index as usize].len() as u64);
-                            a.done += 1;
+                            if let Some(h) = a.have.get_mut(index as usize) {
+                                *h = true;
+                            }
+                        }
+                    }
+                    ClientMessage::SetFiles { torrent_id, files, have } => {
+                        if let Some(a) = active.get_mut(&torrent_id) {
+                            a.select(&torrents[a.idx].meta, &have, &files);
                         }
                     }
                     ClientMessage::Pause { torrent_id } => { if let Some(a) = active.get_mut(&torrent_id) { a.paused = true } }
@@ -203,8 +247,8 @@ async fn serve(
             _ = status.tick() => {
                 let buffer_used: u64 = active.values().map(|a| a.unacked).sum::<u64>() + (18 << 20);
                 for (&id, a) in &active {
-                    let total = torrents[a.idx].meta.piece_count();
-                    let state = if a.done == total {
+                    let (done, total) = a.counts();
+                    let state = if done == total {
                         TorrentState::Finished
                     } else if a.paused {
                         TorrentState::Paused
@@ -218,8 +262,8 @@ async fn serve(
                         peers: if state == TorrentState::Downloading { 9 + id * 7 } else { 0 },
                         down_speed: if state == TorrentState::Downloading { sent * 11 / 10 } else { 0 },
                         up_speed: 0,
-                        progress: a.done as f32 / total as f32,
-                        pieces_done: a.done,
+                        progress: if total == 0 { 1.0 } else { done as f32 / total as f32 },
+                        pieces_done: done,
                         pieces_total: total,
                         buffer_used,
                         buffer_limit: BUFFER_LIMIT,

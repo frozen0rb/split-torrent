@@ -17,6 +17,7 @@ pub use client::{
     AddError, Backoff, Client, ClientConfig, ConfigError, ConnectionState, Event, Notify,
     ServerStatus, TorrentSnapshot,
 };
-pub use metainfo::{InfoHash, Metainfo};
+pub use metainfo::{FileEntry, InfoHash, Metainfo};
 pub use st_protocol::TorrentState;
+pub use storage::Progress;
 pub use tls::Fingerprint;
