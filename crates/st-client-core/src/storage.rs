@@ -1,5 +1,13 @@
 //! Writes verified pieces into pre-allocated files and keeps the resume
-//! bitfield in a `.st-state` file next to the download.
+//! bitfield and the file selection in a `.st-state` file next to the
+//! download.
+//!
+//! Only selected files are created and written. A piece that also covers an
+//! unselected file is still verified as a whole, and counts as present once
+//! its selected parts are on disk. When such a file is selected later, those
+//! shared pieces are dropped from the bitfield so they are fetched again and
+//! the newly selected part gets written too. Deselecting a file keeps what
+//! is already on disk.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -11,7 +19,8 @@ use st_protocol::Bitfield;
 
 use crate::metainfo::{InfoHash, Metainfo};
 
-const STATE_MAGIC: &[u8; 8] = b"STSTATE1";
+const STATE_MAGIC_V1: &[u8; 8] = b"STSTATE1";
+const STATE_MAGIC: &[u8; 8] = b"STSTATE2";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -21,6 +30,8 @@ pub enum StorageError {
     WrongSize { index: u32, got: usize, want: u64 },
     #[error("piece {0} failed SHA-1 verification")]
     HashMismatch(u32),
+    #[error("file selection has {got} entries, torrent has {want} files")]
+    BadSelection { got: usize, want: usize },
     #[error("{path}: {source}")]
     Io {
         path: PathBuf,
@@ -41,60 +52,74 @@ pub fn state_path(download_dir: &Path, meta: &Metainfo) -> PathBuf {
     download_dir.join(format!("{}.st-state", meta.name))
 }
 
+/// Download progress relative to the file selection.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Progress {
+    /// Pieces overlapping a selected file.
+    pub pieces_wanted: u32,
+    /// Of those, pieces that are on disk.
+    pub pieces_have: u32,
+    /// Total length of the selected files.
+    pub bytes_wanted: u64,
+    /// Bytes of the selected files that are on disk.
+    pub bytes_have: u64,
+    /// Per file: bytes on disk. Always 0 for files that are not selected,
+    /// even if data from an earlier selection is still there.
+    pub file_bytes_have: Vec<u64>,
+}
+
 pub struct Storage {
     meta: Arc<Metainfo>,
     download_dir: PathBuf,
     files: Vec<Option<File>>,
     dirty: Vec<bool>,
+    selected: Vec<bool>,
+    wanted: Bitfield,
     have: Bitfield,
+    progress: Progress,
     state_dirty: bool,
 }
 
 impl Storage {
-    /// Creates the directory tree, pre-allocates every file and loads the
-    /// bitfield from `.st-state`. Pieces that touch a file which had to be
-    /// created or resized are dropped from the bitfield.
-    pub fn open(meta: Arc<Metainfo>, download_dir: &Path) -> Result<Self, StorageError> {
-        let mut have = load_state(&state_path(download_dir, &meta), &meta)
-            .unwrap_or_else(|| Bitfield::new(meta.piece_count()));
-        let mut files = Vec::with_capacity(meta.files.len());
-        for (i, f) in meta.files.iter().enumerate() {
-            if f.pad {
-                files.push(None);
-                continue;
+    /// Creates the directories and pre-allocates the selected files, and
+    /// loads the bitfield from `.st-state`. `selected` has one entry per
+    /// torrent file; `None` keeps the selection saved in `.st-state` (or
+    /// selects everything). Padding files are never selected.
+    pub fn open(
+        meta: Arc<Metainfo>,
+        download_dir: &Path,
+        selected: Option<&[bool]>,
+    ) -> Result<Self, StorageError> {
+        let n = meta.files.len();
+        let (have, saved) = load_state(&state_path(download_dir, &meta), &meta)
+            .unwrap_or_else(|| (Bitfield::new(meta.piece_count()), vec![true; n]));
+        let want = match selected {
+            Some(s) if s.len() != n => {
+                return Err(StorageError::BadSelection {
+                    got: s.len(),
+                    want: n,
+                })
             }
-            let path = download_dir.join(meta.file_path(f));
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).map_err(io_err(parent))?;
-            }
-            let existing = fs::metadata(&path)
-                .ok()
-                .filter(|m| m.is_file())
-                .map(|m| m.len());
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&path)
-                .map_err(io_err(&path))?;
-            if existing != Some(f.length) {
-                file.set_len(f.length).map_err(io_err(&path))?;
-                for p in meta.pieces_of_file(i) {
-                    have.set(p, false);
-                }
-            }
-            files.push(Some(file));
-        }
-        let mut s = Self {
-            dirty: vec![false; files.len()],
-            meta,
-            download_dir: download_dir.to_owned(),
-            files,
-            have,
-            state_dirty: true,
+            Some(s) => s.to_vec(),
+            None => saved.clone(),
         };
-        s.flush()?;
+        let mut s = Self {
+            files: (0..n).map(|_| None).collect(),
+            dirty: vec![false; n],
+            selected: vec![false; n],
+            wanted: Bitfield::new(meta.piece_count()),
+            have,
+            progress: Progress::default(),
+            state_dirty: true,
+            download_dir: download_dir.to_owned(),
+            meta,
+        };
+        // Files selected when the state was saved count as already open:
+        // their parts of shared pieces are on disk.
+        for (i, &was) in saved.iter().enumerate() {
+            s.selected[i] = was && !s.meta.files[i].pad;
+        }
+        s.apply_selection(&want)?;
         Ok(s)
     }
 
@@ -114,18 +139,155 @@ impl Storage {
         &self.have
     }
 
-    pub fn bytes_have(&self) -> u64 {
-        self.have.iter_ones().map(|i| self.meta.piece_size(i)).sum()
+    pub fn selected(&self) -> &[bool] {
+        &self.selected
     }
 
-    /// Verifies and writes one piece. The data reaches the OS but is not yet
-    /// durable; call [`Storage::flush`] before acknowledging it.
-    /// Returns `false` if the piece was already present.
+    /// Indices of the selected files, as sent to the server.
+    pub fn selected_indices(&self) -> Vec<u32> {
+        self.selected
+            .iter()
+            .enumerate()
+            .filter(|(_, &s)| s)
+            .map(|(i, _)| i as u32)
+            .collect()
+    }
+
+    pub fn progress(&self) -> &Progress {
+        &self.progress
+    }
+
+    /// Every selected piece is on disk.
+    pub fn complete(&self) -> bool {
+        self.progress.pieces_have == self.progress.pieces_wanted
+    }
+
+    /// Changes the file selection. Newly selected files are created (or
+    /// checked) and their pieces shared with other files are dropped from
+    /// the bitfield; deselected files are closed but kept on disk. Flushes.
+    pub fn set_selection(&mut self, selected: &[bool]) -> Result<(), StorageError> {
+        if selected.len() != self.meta.files.len() {
+            return Err(StorageError::BadSelection {
+                got: selected.len(),
+                want: self.meta.files.len(),
+            });
+        }
+        self.flush()?;
+        self.apply_selection(selected)?;
+        Ok(())
+    }
+
+    fn apply_selection(&mut self, selected: &[bool]) -> Result<(), StorageError> {
+        for (i, &sel) in selected.iter().enumerate() {
+            let want = sel && !self.meta.files[i].pad;
+            let was_selected = self.selected[i];
+            if want && self.files[i].is_none() {
+                self.open_file(i)?;
+                if !was_selected {
+                    self.drop_shared_pieces(i);
+                }
+            } else if !want {
+                self.files[i] = None;
+                self.dirty[i] = false;
+            }
+            self.selected[i] = want;
+        }
+        self.wanted = Bitfield::new(self.meta.piece_count());
+        for i in (0..self.meta.files.len()).filter(|&i| self.selected[i]) {
+            for p in self.meta.pieces_of_file(i) {
+                self.wanted.set(p, true);
+            }
+        }
+        self.recompute_progress();
+        self.state_dirty = true;
+        self.flush()
+    }
+
+    /// Opens (creating if needed) file `i` at its full length. If it had to
+    /// be created or resized, the pieces touching it are dropped.
+    fn open_file(&mut self, i: usize) -> Result<(), StorageError> {
+        let f = &self.meta.files[i];
+        let path = self.download_dir.join(self.meta.file_path(f));
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(io_err(parent))?;
+        }
+        let existing = fs::metadata(&path)
+            .ok()
+            .filter(|m| m.is_file())
+            .map(|m| m.len());
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(io_err(&path))?;
+        if existing != Some(f.length) {
+            file.set_len(f.length).map_err(io_err(&path))?;
+            for p in self.meta.pieces_of_file(i) {
+                self.have.set(p, false);
+            }
+        }
+        self.files[i] = Some(file);
+        Ok(())
+    }
+
+    /// Drops present pieces of file `i` that also cover another (non-pad)
+    /// file: they were written while `i` was not selected, so `i`'s part of
+    /// them may be missing.
+    fn drop_shared_pieces(&mut self, i: usize) {
+        for p in self.meta.pieces_of_file(i) {
+            if self.have.get(p)
+                && self
+                    .meta
+                    .piece_segments(p)
+                    .iter()
+                    .any(|&(fi, ..)| fi != i && !self.meta.files[fi].pad)
+            {
+                self.have.set(p, false);
+            }
+        }
+    }
+
+    fn recompute_progress(&mut self) {
+        let meta = &self.meta;
+        let mut file_bytes_have = vec![0u64; meta.files.len()];
+        for p in self.have.iter_ones() {
+            for (fi, _, _, len) in meta.piece_segments(p) {
+                if self.selected[fi] {
+                    file_bytes_have[fi] += len as u64;
+                }
+            }
+        }
+        let sel = |i: &usize| self.selected[*i];
+        self.progress = Progress {
+            pieces_wanted: self.wanted.count_ones(),
+            pieces_have: self
+                .wanted
+                .iter_ones()
+                .filter(|&p| self.have.get(p))
+                .count() as u32,
+            bytes_wanted: (0..meta.files.len())
+                .filter(sel)
+                .map(|i| meta.files[i].length)
+                .sum(),
+            bytes_have: (0..meta.files.len())
+                .filter(sel)
+                .map(|i| file_bytes_have[i])
+                .sum(),
+            file_bytes_have,
+        };
+    }
+
+    /// Verifies and writes the selected parts of one piece. The data reaches
+    /// the OS but is not yet durable; call [`Storage::flush`] before
+    /// acknowledging it. Returns `false` if nothing was written: the piece
+    /// was already present or covers no selected file.
     pub fn write_piece(&mut self, index: u32, data: &[u8]) -> Result<bool, StorageError> {
         if index >= self.meta.piece_count() {
             return Err(StorageError::OutOfRange(index));
         }
-        if self.have.get(index) {
+        if self.have.get(index) || !self.wanted.get(index) {
             return Ok(false);
         }
         let want = self.meta.piece_size(index);
@@ -139,7 +301,8 @@ impl Storage {
         if <[u8; 20]>::from(Sha1::digest(data)) != self.meta.pieces[index as usize] {
             return Err(StorageError::HashMismatch(index));
         }
-        for (fi, file_off, piece_off, len) in self.meta.piece_segments(index) {
+        let segments = self.meta.piece_segments(index);
+        for &(fi, file_off, piece_off, len) in &segments {
             let Some(file) = self.files[fi].as_mut() else {
                 continue;
             };
@@ -153,11 +316,19 @@ impl Storage {
             self.dirty[fi] = true;
         }
         self.have.set(index, true);
+        self.progress.pieces_have += 1;
+        for (fi, _, _, len) in segments {
+            if self.selected[fi] {
+                self.progress.file_bytes_have[fi] += len as u64;
+                self.progress.bytes_have += len as u64;
+            }
+        }
         self.state_dirty = true;
         Ok(true)
     }
 
-    /// Reads piece `index` back from disk.
+    /// Reads the selected parts of piece `index` back from disk; other parts
+    /// are zero.
     pub fn read_piece(&mut self, index: u32) -> Result<Vec<u8>, StorageError> {
         if index >= self.meta.piece_count() {
             return Err(StorageError::OutOfRange(index));
@@ -177,7 +348,8 @@ impl Storage {
         Ok(buf)
     }
 
-    /// Syncs written data, then atomically persists the bitfield.
+    /// Syncs written data, then atomically persists the bitfield and the
+    /// selection.
     pub fn flush(&mut self) -> Result<(), StorageError> {
         for (i, dirty) in self.dirty.iter_mut().enumerate() {
             if *dirty {
@@ -192,13 +364,15 @@ impl Storage {
         }
         if self.state_dirty {
             let path = state_path(&self.download_dir, &self.meta);
-            save_state(&path, &self.meta.info_hash, &self.have).map_err(io_err(&path))?;
+            save_state(&path, &self.meta.info_hash, &self.have, &self.selected)
+                .map_err(io_err(&path))?;
             self.state_dirty = false;
         }
         Ok(())
     }
 
-    /// Closes and deletes the downloaded files and the state file.
+    /// Closes and deletes the downloaded files (selected or not) and the
+    /// state file.
     pub fn delete_files(self) -> Result<(), StorageError> {
         let Self {
             meta,
@@ -234,24 +408,53 @@ fn remove_empty_dirs(dir: &Path) {
     let _ = fs::remove_dir(dir);
 }
 
-fn load_state(path: &Path, meta: &Metainfo) -> Option<Bitfield> {
+/// Reads `MAGIC, info hash, piece count (u32 LE), have bits` and, in v2,
+/// `file count (u32 LE), selection bits`. v1 files mean "every file".
+fn load_state(path: &Path, meta: &Metainfo) -> Option<(Bitfield, Vec<bool>)> {
     let buf = fs::read(path).ok()?;
-    let rest = buf.strip_prefix(STATE_MAGIC.as_slice())?;
+    let (v2, rest) = if let Some(r) = buf.strip_prefix(STATE_MAGIC.as_slice()) {
+        (true, r)
+    } else {
+        (false, buf.strip_prefix(STATE_MAGIC_V1.as_slice())?)
+    };
     let (hash, rest) = rest.split_at_checked(20)?;
-    let (count, bits) = rest.split_at_checked(4)?;
+    let (count, rest) = rest.split_at_checked(4)?;
     let count = u32::from_le_bytes(count.try_into().ok()?);
     if hash != meta.info_hash || count != meta.piece_count() {
         return None;
     }
-    Bitfield::from_bytes(bits.to_vec(), count)
+    let (bits, rest) = rest.split_at_checked(count.div_ceil(8) as usize)?;
+    let have = Bitfield::from_bytes(bits.to_vec(), count)?;
+    let n = meta.files.len();
+    if !v2 {
+        return rest.is_empty().then(|| (have, vec![true; n]));
+    }
+    let (fc, rest) = rest.split_at_checked(4)?;
+    let fc = u32::from_le_bytes(fc.try_into().ok()?);
+    if fc as usize != n {
+        return None;
+    }
+    let sel = Bitfield::from_bytes(rest.to_vec(), fc)?;
+    Some((have, (0..fc).map(|i| sel.get(i)).collect()))
 }
 
-fn save_state(path: &Path, info_hash: &InfoHash, have: &Bitfield) -> io::Result<()> {
-    let mut buf = Vec::with_capacity(32 + have.as_bytes().len());
+fn save_state(
+    path: &Path,
+    info_hash: &InfoHash,
+    have: &Bitfield,
+    selected: &[bool],
+) -> io::Result<()> {
+    let mut sel = Bitfield::new(selected.len() as u32);
+    for (i, _) in selected.iter().enumerate().filter(|(_, &s)| s) {
+        sel.set(i as u32, true);
+    }
+    let mut buf = Vec::with_capacity(40 + have.as_bytes().len() + sel.as_bytes().len());
     buf.extend_from_slice(STATE_MAGIC);
     buf.extend_from_slice(info_hash);
     buf.extend_from_slice(&have.len().to_le_bytes());
     buf.extend_from_slice(have.as_bytes());
+    buf.extend_from_slice(&sel.len().to_le_bytes());
+    buf.extend_from_slice(sel.as_bytes());
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
@@ -282,7 +485,7 @@ mod tests {
     fn writes_pieces_across_files_in_any_order() {
         let tmp = tempfile::tempdir().unwrap();
         let (meta, pieces, data) = setup(16);
-        let mut s = Storage::open(meta.clone(), tmp.path()).unwrap();
+        let mut s = Storage::open(meta.clone(), tmp.path(), None).unwrap();
         let root = tmp.path().join("multi");
         assert_eq!(fs::metadata(root.join("dir/a.bin")).unwrap().len(), 10);
         assert_eq!(fs::metadata(root.join("empty")).unwrap().len(), 0);
@@ -294,7 +497,7 @@ mod tests {
         assert!(!s.write_piece(1, &pieces[1]).unwrap());
         s.flush().unwrap();
         assert!(s.have().is_full());
-        assert_eq!(s.bytes_have(), 55);
+        assert_eq!(s.progress().bytes_have, 55);
         assert_eq!(fs::read(root.join("dir/a.bin")).unwrap(), data[0]);
         assert_eq!(fs::read(root.join("c.bin")).unwrap(), data[2]);
         assert_eq!(s.read_piece(0).unwrap(), pieces[0]);
@@ -304,7 +507,7 @@ mod tests {
     fn rejects_bad_pieces() {
         let tmp = tempfile::tempdir().unwrap();
         let (meta, pieces, _) = setup(16);
-        let mut s = Storage::open(meta, tmp.path()).unwrap();
+        let mut s = Storage::open(meta, tmp.path(), None).unwrap();
         let mut bad = pieces[0].clone();
         bad[0] ^= 1;
         assert!(matches!(
@@ -327,33 +530,33 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (meta, pieces, _) = setup(16);
         {
-            let mut s = Storage::open(meta.clone(), tmp.path()).unwrap();
+            let mut s = Storage::open(meta.clone(), tmp.path(), None).unwrap();
             s.write_piece(1, &pieces[1]).unwrap();
             s.write_piece(3, &pieces[3]).unwrap();
             s.flush().unwrap();
         }
         assert!(state_path(tmp.path(), &meta).exists());
-        let s = Storage::open(meta.clone(), tmp.path()).unwrap();
+        let s = Storage::open(meta.clone(), tmp.path(), None).unwrap();
         assert_eq!(s.have().iter_ones().collect::<Vec<_>>(), vec![1, 3]);
         drop(s);
 
         // Unflushed state is not persisted.
         {
-            let mut s = Storage::open(meta.clone(), tmp.path()).unwrap();
+            let mut s = Storage::open(meta.clone(), tmp.path(), None).unwrap();
             s.write_piece(0, &pieces[0]).unwrap();
             std::mem::forget(s);
         }
-        let s = Storage::open(meta.clone(), tmp.path()).unwrap();
+        let s = Storage::open(meta.clone(), tmp.path(), None).unwrap();
         assert_eq!(s.have().iter_ones().collect::<Vec<_>>(), vec![1, 3]);
         drop(s);
 
         // A file that was truncated invalidates the pieces touching it.
         fs::write(tmp.path().join("multi/dir/a.bin"), b"short").unwrap();
-        let s = Storage::open(meta.clone(), tmp.path()).unwrap();
+        let s = Storage::open(meta.clone(), tmp.path(), None).unwrap();
         assert_eq!(s.have().iter_ones().collect::<Vec<_>>(), vec![1, 3]);
         drop(s);
         fs::remove_file(tmp.path().join("multi/c.bin")).unwrap();
-        let s = Storage::open(meta.clone(), tmp.path()).unwrap();
+        let s = Storage::open(meta.clone(), tmp.path(), None).unwrap();
         assert_eq!(s.have().count_ones(), 0);
 
         // A state file for another torrent is ignored.
@@ -367,12 +570,102 @@ mod tests {
     }
 
     #[test]
+    fn writes_only_selected_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (meta, pieces, data) = setup(16);
+        let root = tmp.path().join("multi");
+        let mut s = Storage::open(meta.clone(), tmp.path(), Some(&[true, false, false])).unwrap();
+        assert!(root.join("dir/a.bin").exists());
+        assert!(!root.join("c.bin").exists());
+        assert!(!root.join("empty").exists());
+        assert_eq!(s.selected_indices(), vec![0]);
+        let p = s.progress().clone();
+        assert_eq!((p.pieces_wanted, p.bytes_wanted, p.bytes_have), (1, 10, 0));
+
+        // Piece 0 covers a.bin and the start of c.bin; only a.bin is written.
+        assert!(!s.write_piece(1, &pieces[1]).unwrap(), "not selected");
+        assert!(s.write_piece(0, &pieces[0]).unwrap());
+        s.flush().unwrap();
+        assert!(s.complete());
+        assert_eq!(s.progress().bytes_have, 10);
+        assert_eq!(s.progress().file_bytes_have, vec![10, 0, 0]);
+        assert_eq!(fs::read(root.join("dir/a.bin")).unwrap(), data[0]);
+        assert!(!root.join("c.bin").exists());
+        drop(s);
+
+        // Reopening keeps the saved selection.
+        let mut s = Storage::open(meta.clone(), tmp.path(), None).unwrap();
+        assert_eq!(s.selected(), &[true, false, false]);
+        assert_eq!(s.have().iter_ones().collect::<Vec<_>>(), vec![0]);
+
+        // Selecting c.bin drops the shared piece 0: its c.bin part is missing.
+        s.set_selection(&[true, true, true]).unwrap();
+        assert!(s.have().count_ones() == 0);
+        assert!(!s.complete());
+        assert_eq!(s.progress().bytes_wanted, 55);
+        for i in 0..4 {
+            assert!(s.write_piece(i, &pieces[i as usize]).unwrap());
+        }
+        s.flush().unwrap();
+        assert!(s.complete());
+        assert_eq!(fs::read(root.join("dir/a.bin")).unwrap(), data[0]);
+        assert_eq!(fs::read(root.join("c.bin")).unwrap(), data[2]);
+    }
+
+    #[test]
+    fn deselecting_keeps_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (meta, pieces, data) = setup(16);
+        let root = tmp.path().join("multi");
+        let mut s = Storage::open(meta.clone(), tmp.path(), None).unwrap();
+        for i in 0..4 {
+            s.write_piece(i, &pieces[i as usize]).unwrap();
+        }
+        s.set_selection(&[false, false, true]).unwrap();
+        assert!(s.complete());
+        assert_eq!(s.progress().bytes_wanted, 45);
+        assert_eq!(fs::read(root.join("dir/a.bin")).unwrap(), data[0]);
+        drop(s);
+        let mut s = Storage::open(meta.clone(), tmp.path(), None).unwrap();
+        assert_eq!(s.selected(), &[false, false, true]);
+        assert!(s.have().is_full());
+        // a.bin was not selected when piece 0 was last confirmed: refetch it.
+        s.set_selection(&[true, false, true]).unwrap();
+        assert_eq!(s.have().iter_zeros().collect::<Vec<_>>(), vec![0]);
+        assert!(matches!(
+            s.set_selection(&[true]),
+            Err(StorageError::BadSelection { got: 1, want: 3 })
+        ));
+    }
+
+    #[test]
+    fn reads_v1_state_as_all_selected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (meta, pieces, _) = setup(16);
+        {
+            let mut s = Storage::open(meta.clone(), tmp.path(), None).unwrap();
+            s.write_piece(2, &pieces[2]).unwrap();
+            s.flush().unwrap();
+        }
+        let mut have = Bitfield::new(4);
+        have.set(2, true);
+        let mut v1 = STATE_MAGIC_V1.to_vec();
+        v1.extend_from_slice(&meta.info_hash);
+        v1.extend_from_slice(&4u32.to_le_bytes());
+        v1.extend_from_slice(have.as_bytes());
+        fs::write(state_path(tmp.path(), &meta), v1).unwrap();
+        let s = Storage::open(meta, tmp.path(), None).unwrap();
+        assert_eq!(s.selected(), &[true, true, true]);
+        assert_eq!(s.have().iter_ones().collect::<Vec<_>>(), vec![2]);
+    }
+
+    #[test]
     fn single_file_layout() {
         let tmp = tempfile::tempdir().unwrap();
         let data = pseudo_random(100, 9);
         let (bytes, pieces) = make_torrent("file.iso", &[("file.iso", &data)], 32);
         let meta = Arc::new(Metainfo::parse(&bytes).unwrap());
-        let mut s = Storage::open(meta, tmp.path()).unwrap();
+        let mut s = Storage::open(meta, tmp.path(), None).unwrap();
         for (i, p) in pieces.iter().enumerate().rev() {
             s.write_piece(i as u32, p).unwrap();
         }

@@ -4,7 +4,7 @@
 //! [`TorrentBuffer`] holds one torrent's pieces: *partial* pieces that are
 //! being downloaded and *complete* (hash-verified) pieces waiting for the
 //! client's ACK. Memory is returned to the pool as soon as a piece is ACKed or
-//! turns out to be one the client already has.
+//! turns out to be one the client already has or did not select.
 //!
 //! Backpressure has two levels:
 //! - soft: [`BufferPool::pressure`] tells the engine to throttle swarm
@@ -16,7 +16,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use parking_lot::{Condvar, Mutex};
@@ -170,11 +170,21 @@ impl Geometry {
     }
 }
 
+struct Partial {
+    data: Vec<u8>,
+    last_write: Instant,
+}
+
 struct Inner {
-    partial: HashMap<u32, Vec<u8>>,
+    partial: HashMap<u32, Partial>,
     complete: BTreeMap<u32, Bytes>,
     /// Pieces the client has (ACKed, or reported in `AddTorrent`).
     done: Bitfield,
+    /// Pieces overlapping the client's selected files.
+    wanted: Bitfield,
+    /// Pieces librqbit verified while this buffer was in use. librqbit will
+    /// not download them again.
+    verified: Bitfield,
     /// Complete pieces not yet sent on the current connection.
     unsent: BTreeSet<u32>,
 }
@@ -188,9 +198,16 @@ pub struct TorrentBuffer {
 }
 
 impl TorrentBuffer {
-    /// `have` must have `geom.piece_count()` bits.
-    pub fn new(pool: Arc<BufferPool>, geom: Geometry, have: Bitfield) -> Arc<Self> {
-        assert_eq!(have.len(), geom.piece_count());
+    /// `have` and `wanted` must have `geom.piece_count()` bits.
+    pub fn new(
+        pool: Arc<BufferPool>,
+        geom: Geometry,
+        have: Bitfield,
+        wanted: Bitfield,
+    ) -> Arc<Self> {
+        let n = geom.piece_count();
+        assert_eq!(have.len(), n);
+        assert_eq!(wanted.len(), n);
         Arc::new(Self {
             pool,
             geom,
@@ -198,6 +215,8 @@ impl TorrentBuffer {
                 partial: HashMap::new(),
                 complete: BTreeMap::new(),
                 done: have,
+                wanted,
+                verified: Bitfield::new(n),
                 unsent: BTreeSet::new(),
             }),
             ready: tokio::sync::Notify::new(),
@@ -237,7 +256,8 @@ impl TorrentBuffer {
         {
             let mut g = self.inner.lock();
             if let Some(p) = g.partial.get_mut(&index) {
-                p[at..at + data.len()].copy_from_slice(data);
+                p.data[at..at + data.len()].copy_from_slice(data);
+                p.last_write = Instant::now();
                 return Ok(());
             }
             if g.complete.contains_key(&index) {
@@ -260,9 +280,13 @@ impl TorrentBuffer {
         let mut inserted = false;
         let p = g.partial.entry(index).or_insert_with(|| {
             inserted = true;
-            vec![0; plen as usize]
+            Partial {
+                data: vec![0; plen as usize],
+                last_write: Instant::now(),
+            }
         });
-        p[at..at + data.len()].copy_from_slice(data);
+        p.data[at..at + data.len()].copy_from_slice(data);
+        p.last_write = Instant::now();
         if !inserted {
             // Another writer allocated it while we waited for the pool.
             drop(g);
@@ -278,7 +302,7 @@ impl TorrentBuffer {
             let (index, n) = self.piece_span(abs, buf.len())?;
             let at = (abs % u64::from(self.geom.piece_length)) as usize;
             let src: &[u8] = if let Some(p) = g.partial.get(&index) {
-                p
+                &p.data
             } else if let Some(p) = g.complete.get(&index) {
                 p
             } else {
@@ -295,12 +319,13 @@ impl TorrentBuffer {
     /// Called after librqbit verified the piece hash.
     pub fn piece_completed(&self, index: u32) {
         let mut g = self.inner.lock();
-        let Some(data) = g.partial.remove(&index) else {
+        let Some(Partial { data, .. }) = g.partial.remove(&index) else {
             return;
         };
         let len = data.len() as u64;
         self.pool.partial_to_complete(len);
-        if g.done.get(index) {
+        g.verified.set(index, true);
+        if g.done.get(index) || !g.wanted.get(index) {
             drop(g);
             self.pool.release_complete(len);
             return;
@@ -375,27 +400,114 @@ impl TorrentBuffer {
         }
     }
 
-    /// Pieces that were ACKed (and freed) but that the client now reports as
-    /// missing. They can only be recovered by downloading them again.
-    pub fn lost_pieces(&self, have: &Bitfield) -> Vec<u32> {
+    /// Pieces in `wanted` that the client lacks according to `have` and that
+    /// librqbit will not fetch again: they were ACKed or verified and then
+    /// freed. They can only be recovered by restarting the torrent.
+    pub fn lost_pieces(&self, have: &Bitfield, wanted: &Bitfield) -> Vec<u32> {
         let g = self.inner.lock();
-        g.done
+        wanted
             .iter_ones()
-            .filter(|&i| !have.get(i) && !g.complete.contains_key(&i))
+            .filter(|&i| {
+                !have.get(i) && !g.complete.contains_key(&i) && (g.done.get(i) || g.verified.get(i))
+            })
             .collect()
     }
 
-    pub fn done_count(&self) -> u32 {
-        self.inner.lock().done.count_ones()
+    /// Changes the selection and frees complete pieces that are no longer
+    /// wanted. Partial pieces stay: librqbit may still be writing them, and
+    /// they are freed on completion or by [`drop_stale`](Self::drop_stale).
+    pub fn set_wanted(&self, wanted: Bitfield) {
+        assert_eq!(wanted.len(), self.geom.piece_count());
+        let mut g = self.inner.lock();
+        let gone: Vec<u32> = g
+            .complete
+            .keys()
+            .copied()
+            .filter(|&i| !wanted.get(i))
+            .collect();
+        let mut freed = 0u64;
+        for i in gone {
+            g.unsent.remove(&i);
+            if let Some(d) = g.complete.remove(&i) {
+                freed += d.len() as u64;
+            }
+        }
+        g.wanted = wanted;
+        drop(g);
+        if freed > 0 {
+            self.pool.release_complete(freed);
+        }
     }
 
+    /// Frees partial pieces that are not wanted and were not written for
+    /// `max_idle`, e.g. a deselected piece whose peer went away.
+    pub fn drop_stale(&self, max_idle: Duration) -> usize {
+        let mut g = self.inner.lock();
+        let Inner {
+            partial, wanted, ..
+        } = &mut *g;
+        let stale: Vec<u32> = partial
+            .iter()
+            .filter(|(i, p)| !wanted.get(**i) && p.last_write.elapsed() >= max_idle)
+            .map(|(i, _)| *i)
+            .collect();
+        let lens: Vec<u64> = stale
+            .iter()
+            .filter_map(|i| partial.remove(i))
+            .map(|p| p.data.len() as u64)
+            .collect();
+        drop(g);
+        for &len in &lens {
+            self.pool.release_partial(len);
+        }
+        lens.len()
+    }
+
+    /// Moves complete pieces that `self` still needs from `old` into `self`,
+    /// e.g. when the torrent is restarted with a fresh buffer.
+    pub fn adopt_complete(&self, old: &TorrentBuffer) {
+        let mut from = old.inner.lock();
+        let mut to = self.inner.lock();
+        let keep: Vec<u32> = from
+            .complete
+            .keys()
+            .copied()
+            .filter(|&i| to.wanted.get(i) && !to.done.get(i))
+            .collect();
+        for i in keep {
+            let data = from.complete.remove(&i).expect("listed");
+            from.unsent.remove(&i);
+            to.complete.insert(i, data);
+            to.unsent.insert(i);
+        }
+        drop((from, to));
+        self.ready.notify_one();
+    }
+
+    /// Selected pieces the client has.
+    pub fn done_count(&self) -> u32 {
+        let g = self.inner.lock();
+        g.wanted.iter_ones().filter(|&i| g.done.get(i)).count() as u32
+    }
+
+    pub fn wanted_count(&self) -> u32 {
+        self.inner.lock().wanted.count_ones()
+    }
+
+    /// Pieces the client has (ACKed or reported).
+    pub fn done(&self) -> Bitfield {
+        self.inner.lock().done.clone()
+    }
+
+    /// The client has every selected piece.
     pub fn is_finished(&self) -> bool {
-        self.inner.lock().done.is_full()
+        let g = self.inner.lock();
+        (0..g.wanted.len()).all(|i| !g.wanted.get(i) || g.done.get(i))
     }
 
     pub fn buffered_bytes(&self) -> u64 {
         let g = self.inner.lock();
-        g.partial.values().map(|p| p.len() as u64).sum::<u64>()
+        g.partial.values().map(|p| p.data.len() as u64).sum::<u64>()
             + g.complete.values().map(|p| p.len() as u64).sum::<u64>()
     }
 
@@ -403,7 +515,11 @@ impl TorrentBuffer {
     pub fn close(&self) {
         self.closed.store(true, Ordering::Relaxed);
         let mut g = self.inner.lock();
-        let partial: Vec<u64> = g.partial.drain().map(|(_, p)| p.len() as u64).collect();
+        let partial: Vec<u64> = g
+            .partial
+            .drain()
+            .map(|(_, p)| p.data.len() as u64)
+            .collect();
         let complete: u64 = std::mem::take(&mut g.complete)
             .into_values()
             .map(|d| d.len() as u64)
@@ -458,7 +574,12 @@ mod tests {
     #[test]
     fn write_read_complete_ack_frees_memory() {
         let pool = BufferPool::new(10 * u64::from(PL), 8);
-        let buf = TorrentBuffer::new(pool.clone(), geom(3, 100), Bitfield::new(3));
+        let buf = TorrentBuffer::new(
+            pool.clone(),
+            geom(3, 100),
+            Bitfield::new(3),
+            Bitfield::full(3),
+        );
 
         buf.write(10, &[1, 2, 3]).unwrap();
         assert_eq!(pool.stats().inflight_pieces, 1);
@@ -491,7 +612,12 @@ mod tests {
     #[test]
     fn write_spanning_two_pieces() {
         let pool = BufferPool::new(10 * u64::from(PL), 8);
-        let buf = TorrentBuffer::new(pool.clone(), geom(3, PL), Bitfield::new(3));
+        let buf = TorrentBuffer::new(
+            pool.clone(),
+            geom(3, PL),
+            Bitfield::new(3),
+            Bitfield::full(3),
+        );
         buf.write(u64::from(PL) - 2, &[7, 7, 8, 8]).unwrap();
         assert_eq!(pool.stats().inflight_pieces, 2);
         let mut out = [0; 4];
@@ -505,7 +631,7 @@ mod tests {
         let pool = BufferPool::new(10 * u64::from(PL), 8);
         let mut have = Bitfield::new(4);
         have.set(1, true);
-        let buf = TorrentBuffer::new(pool.clone(), geom(4, PL), have);
+        let buf = TorrentBuffer::new(pool.clone(), geom(4, PL), have, Bitfield::full(4));
         fill(&buf, 1);
         buf.piece_completed(1);
         assert_eq!(pool.used(), 0);
@@ -515,7 +641,12 @@ mod tests {
     #[test]
     fn merge_have_frees_and_lost_pieces_detected() {
         let pool = BufferPool::new(10 * u64::from(PL), 8);
-        let buf = TorrentBuffer::new(pool.clone(), geom(4, PL), Bitfield::new(4));
+        let buf = TorrentBuffer::new(
+            pool.clone(),
+            geom(4, PL),
+            Bitfield::new(4),
+            Bitfield::full(4),
+        );
         for i in 0..3 {
             fill(&buf, i);
             buf.piece_completed(i);
@@ -526,18 +657,112 @@ mod tests {
         let mut have = Bitfield::new(4);
         have.set(0, true);
         have.set(1, true);
-        assert!(buf.lost_pieces(&have).is_empty());
+        let all = Bitfield::full(4);
+        assert!(buf.lost_pieces(&have, &all).is_empty());
         buf.merge_have(&have);
         assert_eq!(pool.used(), u64::from(PL));
         assert_eq!(buf.next_unsent().map(|p| p.0), Some(2));
 
-        assert_eq!(buf.lost_pieces(&Bitfield::new(4)), vec![0, 1]);
+        assert_eq!(buf.lost_pieces(&Bitfield::new(4), &all), vec![0, 1]);
+    }
+
+    fn bits(n: u32, ones: &[u32]) -> Bitfield {
+        let mut b = Bitfield::new(n);
+        for &i in ones {
+            b.set(i, true);
+        }
+        b
+    }
+
+    #[test]
+    fn unwanted_pieces_are_not_kept_and_do_not_block_finish() {
+        let pool = BufferPool::new(10 * u64::from(PL), 8);
+        let buf = TorrentBuffer::new(
+            pool.clone(),
+            geom(4, PL),
+            Bitfield::new(4),
+            bits(4, &[0, 1]),
+        );
+        assert_eq!(buf.wanted_count(), 2);
+        fill(&buf, 3);
+        buf.piece_completed(3);
+        assert_eq!(pool.used(), 0, "unwanted piece freed on completion");
+        assert!(buf.next_unsent().is_none());
+        for i in 0..2 {
+            fill(&buf, i);
+            buf.piece_completed(i);
+            buf.ack(i);
+        }
+        assert!(buf.is_finished());
+        assert_eq!(buf.done_count(), 2);
+    }
+
+    #[test]
+    fn deselecting_frees_complete_pieces_and_stale_partials() {
+        let pool = BufferPool::new(10 * u64::from(PL), 8);
+        let buf = TorrentBuffer::new(
+            pool.clone(),
+            geom(4, PL),
+            Bitfield::new(4),
+            Bitfield::full(4),
+        );
+        for i in 0..3 {
+            fill(&buf, i);
+        }
+        buf.piece_completed(0);
+        buf.piece_completed(1);
+        assert_eq!(pool.used(), 3 * u64::from(PL));
+
+        // Keep piece 0 (e.g. shared with a still-selected file).
+        buf.set_wanted(bits(4, &[0, 3]));
+        assert_eq!(pool.used(), 2 * u64::from(PL), "piece 1 freed");
+        assert_eq!(buf.next_unsent().map(|p| p.0), Some(0));
+        assert!(buf.next_unsent().is_none());
+
+        // The partial piece 2 survives until it is idle long enough.
+        assert_eq!(buf.drop_stale(Duration::from_secs(60)), 0);
+        assert_eq!(buf.drop_stale(Duration::ZERO), 1);
+        assert_eq!(pool.used(), u64::from(PL));
+        assert_eq!(pool.stats().inflight_pieces, 0);
+
+        // Piece 1 was verified by librqbit and freed: it is lost if wanted again.
+        assert_eq!(
+            buf.lost_pieces(&Bitfield::new(4), &Bitfield::full(4)),
+            vec![1]
+        );
+        assert!(buf
+            .lost_pieces(&Bitfield::new(4), &bits(4, &[0, 2, 3]))
+            .is_empty());
+    }
+
+    #[test]
+    fn restart_adopts_complete_pieces() {
+        let pool = BufferPool::new(10 * u64::from(PL), 8);
+        let old = TorrentBuffer::new(
+            pool.clone(),
+            geom(4, PL),
+            Bitfield::new(4),
+            Bitfield::full(4),
+        );
+        for i in 0..3 {
+            fill(&old, i);
+            old.piece_completed(i);
+        }
+        let new = TorrentBuffer::new(pool.clone(), geom(4, PL), bits(4, &[0]), bits(4, &[0, 1]));
+        new.adopt_complete(&old);
+        old.close();
+        assert_eq!(pool.used(), u64::from(PL), "only piece 1 moved");
+        let (i, data) = new.next_unsent().unwrap();
+        assert_eq!((i, data[0]), (1, 1));
+        new.ack(1);
+        assert_eq!(pool.used(), 0);
+        assert!(new.is_finished());
     }
 
     #[test]
     fn reset_unsent_resends_unacked() {
         let pool = BufferPool::new(10 * u64::from(PL), 8);
-        let buf = TorrentBuffer::new(pool, geom(4, PL), Bitfield::new(4));
+        let buf = TorrentBuffer::new(pool, geom(4, PL), Bitfield::new(4), Bitfield::full(4));
         for i in [2, 0] {
             fill(&buf, i);
             buf.piece_completed(i);
@@ -554,7 +779,12 @@ mod tests {
     #[test]
     fn soft_pressure_has_hysteresis_and_inflight_cap() {
         let pool = BufferPool::new(8 * u64::from(PL), 3);
-        let buf = TorrentBuffer::new(pool.clone(), geom(8, PL), Bitfield::new(8));
+        let buf = TorrentBuffer::new(
+            pool.clone(),
+            geom(8, PL),
+            Bitfield::new(8),
+            Bitfield::full(8),
+        );
         fill(&buf, 0);
         fill(&buf, 1);
         assert!(!pool.pressure(false));
@@ -582,7 +812,12 @@ mod tests {
     #[test]
     fn hard_limit_blocks_until_ack() {
         let pool = BufferPool::new(2 * u64::from(PL), 8);
-        let buf = TorrentBuffer::new(pool.clone(), geom(4, PL), Bitfield::new(4));
+        let buf = TorrentBuffer::new(
+            pool.clone(),
+            geom(4, PL),
+            Bitfield::new(4),
+            Bitfield::full(4),
+        );
         fill(&buf, 0);
         fill(&buf, 1);
         buf.piece_completed(0);
@@ -611,7 +846,12 @@ mod tests {
     #[test]
     fn hard_limit_does_not_deadlock_without_complete_pieces() {
         let pool = BufferPool::new(u64::from(PL), 8);
-        let buf = TorrentBuffer::new(pool.clone(), geom(4, PL), Bitfield::new(4));
+        let buf = TorrentBuffer::new(
+            pool.clone(),
+            geom(4, PL),
+            Bitfield::new(4),
+            Bitfield::full(4),
+        );
         fill(&buf, 0);
         fill(&buf, 1);
         assert_eq!(pool.used(), 2 * u64::from(PL));
@@ -620,7 +860,12 @@ mod tests {
     #[test]
     fn close_frees_everything_and_unblocks_writers() {
         let pool = BufferPool::new(u64::from(PL), 8);
-        let buf = TorrentBuffer::new(pool.clone(), geom(4, PL), Bitfield::new(4));
+        let buf = TorrentBuffer::new(
+            pool.clone(),
+            geom(4, PL),
+            Bitfield::new(4),
+            Bitfield::full(4),
+        );
         fill(&buf, 0);
         buf.piece_completed(0);
         let b2 = buf.clone();
@@ -635,7 +880,12 @@ mod tests {
     #[test]
     fn drop_returns_memory_to_pool() {
         let pool = BufferPool::new(10 * u64::from(PL), 8);
-        let buf = TorrentBuffer::new(pool.clone(), geom(4, PL), Bitfield::new(4));
+        let buf = TorrentBuffer::new(
+            pool.clone(),
+            geom(4, PL),
+            Bitfield::new(4),
+            Bitfield::full(4),
+        );
         fill(&buf, 0);
         fill(&buf, 1);
         buf.piece_completed(1);
@@ -649,7 +899,7 @@ mod tests {
         let pool = BufferPool::new(10 * u64::from(PL), 8);
         let mut have = Bitfield::new(2);
         have.set(0, true);
-        let buf = TorrentBuffer::new(pool, geom(2, 10), have);
+        let buf = TorrentBuffer::new(pool, geom(2, 10), have, Bitfield::full(2));
         assert!(!buf.is_finished());
         fill(&buf, 1);
         buf.piece_completed(1);

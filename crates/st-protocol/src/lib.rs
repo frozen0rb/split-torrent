@@ -8,10 +8,10 @@
 //! Typical session:
 //!
 //! 1. client → `Hello { token, version }`, server → `HelloOk` (or `Error` and close)
-//! 2. client → `AddTorrent { torrent_bytes, have }`, server → `TorrentAdded`
+//! 2. client → `AddTorrent { torrent_bytes, have, files }`, server → `TorrentAdded`
 //! 3. server → `Piece { .. }` (SHA-1 already verified), client → `Ack { .. }`
 //!    after the piece is durably written; server → `Status` about once a second
-//! 4. client → `Pause` / `Resume` / `Remove` at any time
+//! 4. client → `Pause` / `Resume` / `SetFiles` / `Remove` at any time
 
 mod bitfield;
 mod codec;

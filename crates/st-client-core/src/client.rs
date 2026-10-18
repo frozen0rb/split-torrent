@@ -20,7 +20,7 @@ use tokio::sync::mpsc;
 use tokio_rustls::TlsConnector;
 
 use crate::metainfo::{InfoHash, Metainfo, MetainfoError};
-use crate::storage::{Storage, StorageError};
+use crate::storage::{Progress, Storage, StorageError};
 use crate::tls::{self, BadFingerprint, Fingerprint};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -139,10 +139,21 @@ pub struct TorrentSnapshot {
     pub info_hash: InfoHash,
     pub name: String,
     pub download_dir: PathBuf,
+    /// Length of the whole torrent.
     pub total_length: u64,
     pub piece_count: u32,
+    /// One entry per torrent file (see [`Metainfo::files`]).
+    pub selected: Vec<bool>,
+    /// Pieces overlapping a selected file.
+    pub pieces_wanted: u32,
+    /// Of those, pieces on disk.
     pub pieces_have: u32,
+    /// Total length of the selected files.
+    pub bytes_wanted: u64,
+    /// Bytes of the selected files on disk.
     pub bytes_have: u64,
+    /// Per file: bytes on disk; 0 for files that are not selected.
+    pub file_bytes_have: Vec<u64>,
     /// Bytes per second received from the server.
     pub recv_speed: u64,
     pub paused: bool,
@@ -153,15 +164,17 @@ pub struct TorrentSnapshot {
 }
 
 impl TorrentSnapshot {
+    /// Every selected file is on disk.
     pub fn complete(&self) -> bool {
-        self.pieces_have == self.piece_count
+        self.pieces_have == self.pieces_wanted
     }
 
+    /// Fraction of the selected bytes on disk.
     pub fn progress(&self) -> f32 {
-        if self.total_length == 0 {
+        if self.bytes_wanted == 0 {
             1.0
         } else {
-            (self.bytes_have as f64 / self.total_length as f64) as f32
+            (self.bytes_have as f64 / self.bytes_wanted as f64) as f32
         }
     }
 }
@@ -183,6 +196,8 @@ pub enum AddError {
     Storage(#[from] StorageError),
     #[error("this torrent is already in the list")]
     Duplicate,
+    #[error("no files selected")]
+    NothingSelected,
     #[error("client is stopped")]
     Stopped,
 }
@@ -191,6 +206,7 @@ enum Command {
     Add(Box<Torrent>),
     Pause(InfoHash),
     Resume(InfoHash),
+    SetFiles(InfoHash, Vec<bool>),
     Remove {
         info_hash: InfoHash,
         delete_files: bool,
@@ -230,19 +246,25 @@ impl Client {
         (Self { cmd: cmd_tx, known }, ev_rx)
     }
 
-    /// Parses the torrent, creates/pre-allocates its files under
-    /// `download_dir` and loads resume state. Blocks on file I/O.
+    /// Parses the torrent, creates/pre-allocates the selected files under
+    /// `download_dir` and loads resume state. `selected` has one entry per
+    /// file of the torrent; `None` keeps the selection saved with the resume
+    /// state, or selects every file. Blocks on file I/O.
     pub fn add_torrent(
         &self,
         torrent_bytes: Vec<u8>,
         download_dir: &Path,
         paused: bool,
+        selected: Option<&[bool]>,
     ) -> Result<TorrentSnapshot, AddError> {
         let meta = Arc::new(Metainfo::parse(&torrent_bytes)?);
+        if selected.is_some_and(|s| !s.contains(&true)) {
+            return Err(AddError::NothingSelected);
+        }
         if !self.known.lock().unwrap().insert(meta.info_hash) {
             return Err(AddError::Duplicate);
         }
-        let storage = match Storage::open(meta.clone(), download_dir) {
+        let storage = match Storage::open(meta.clone(), download_dir, selected) {
             Ok(s) => s,
             Err(e) => {
                 self.known.lock().unwrap().remove(&meta.info_hash);
@@ -263,6 +285,12 @@ impl Client {
 
     pub fn resume(&self, info_hash: InfoHash) {
         let _ = self.cmd.send(Command::Resume(info_hash));
+    }
+
+    /// Changes which files of a torrent are downloaded, while it runs or is
+    /// paused. Files that are deselected keep what is already on disk.
+    pub fn set_files(&self, info_hash: InfoHash, selected: Vec<bool>) {
+        let _ = self.cmd.send(Command::SetFiles(info_hash, selected));
     }
 
     pub fn remove(&self, info_hash: InfoHash, delete_files: bool) {
@@ -295,8 +323,11 @@ struct Torrent {
     add_sent: bool,
     server: Option<ServerStatus>,
     error: Option<String>,
-    pieces_have: u32,
-    bytes_have: u64,
+    selected: Vec<bool>,
+    progress: Progress,
+    /// The selection changed after `AddTorrent` was sent but before the
+    /// server answered; `SetFiles` follows `TorrentAdded`.
+    files_changed: bool,
     recv_bytes: u64,
     recv_speed: u64,
     pending_acks: Vec<u32>,
@@ -308,8 +339,9 @@ impl Torrent {
         Self {
             meta: storage.meta().clone(),
             download_dir: storage.download_dir().to_owned(),
-            pieces_have: storage.have().count_ones(),
-            bytes_have: storage.bytes_have(),
+            selected: storage.selected().to_vec(),
+            progress: storage.progress().clone(),
+            files_changed: false,
             storage: Arc::new(Mutex::new(storage)),
             torrent_bytes,
             paused,
@@ -325,7 +357,7 @@ impl Torrent {
     }
 
     fn complete(&self) -> bool {
-        self.pieces_have == self.meta.piece_count()
+        self.progress.pieces_have == self.progress.pieces_wanted
     }
 
     fn snapshot(&self) -> TorrentSnapshot {
@@ -335,8 +367,12 @@ impl Torrent {
             download_dir: self.download_dir.clone(),
             total_length: self.meta.total_length,
             piece_count: self.meta.piece_count(),
-            pieces_have: self.pieces_have,
-            bytes_have: self.bytes_have,
+            selected: self.selected.clone(),
+            pieces_wanted: self.progress.pieces_wanted,
+            pieces_have: self.progress.pieces_have,
+            bytes_wanted: self.progress.bytes_wanted,
+            bytes_have: self.progress.bytes_have,
+            file_bytes_have: self.progress.file_bytes_have.clone(),
             recv_speed: self.recv_speed,
             paused: self.paused,
             online: self.server_id.is_some(),
@@ -348,6 +384,7 @@ impl Torrent {
     fn go_offline(&mut self) {
         self.server_id = None;
         self.add_sent = false;
+        self.files_changed = false;
         self.server = None;
         self.recv_speed = 0;
         self.pending_acks.clear();
@@ -582,11 +619,15 @@ impl Actor {
             if t.add_sent || t.complete() || t.error.is_some() {
                 continue;
             }
-            let have = t.storage.lock().unwrap().have().clone();
+            let (have, files) = {
+                let s = t.storage.lock().unwrap();
+                (s.have().clone(), s.selected_indices())
+            };
             t.add_sent = true;
             self.outbox.push(ClientMessage::AddTorrent {
                 torrent_bytes: t.torrent_bytes.clone(),
                 have,
+                files,
             });
         }
     }
@@ -617,6 +658,14 @@ impl Actor {
                     t.changed = true;
                     if t.paused {
                         self.outbox.push(ClientMessage::Pause { torrent_id });
+                    }
+                    if std::mem::take(&mut t.files_changed) {
+                        let s = t.storage.lock().unwrap();
+                        self.outbox.push(ClientMessage::SetFiles {
+                            torrent_id,
+                            files: s.selected_indices(),
+                            have: s.have().clone(),
+                        });
                     }
                 }
                 None => self.outbox.push(ClientMessage::Remove { torrent_id }),
@@ -687,15 +736,14 @@ impl Actor {
         let res = tokio::task::spawn_blocking(move || {
             let mut s = storage.lock().unwrap();
             let r = s.write_piece(index, &data);
-            (r, s.have().count_ones(), s.bytes_have())
+            (r, s.progress().clone())
         })
         .await
         .expect("storage task panicked");
         let t = self.by_server_id(torrent_id).expect("still present");
         match res {
-            (Ok(_), pieces, bytes) => {
-                t.pieces_have = pieces;
-                t.bytes_have = bytes;
+            (Ok(_), progress) => {
+                t.progress = progress;
                 t.pending_acks.push(index);
                 t.changed = true;
                 Ok(len)
@@ -789,6 +837,7 @@ impl Actor {
                 }
                 self.queue_adds_if_online();
             }
+            Some(Command::SetFiles(ih, selected)) => self.set_files(ih, selected).await,
             Some(Command::Remove {
                 info_hash,
                 delete_files,
@@ -823,6 +872,56 @@ impl Actor {
             }
         }
         true
+    }
+
+    async fn set_files(&mut self, ih: InfoHash, selected: Vec<bool>) {
+        if !self.torrents.contains_key(&ih) {
+            return;
+        }
+        if !selected.contains(&true) {
+            self.emit(Event::Warning(AddError::NothingSelected.to_string()));
+            return;
+        }
+        // ACK what is written first: the new selection may drop pieces again
+        // and the server must see them as lost, not as still unacknowledged.
+        self.flush_all().await;
+        let Some(t) = self.torrents.get_mut(&ih) else {
+            return;
+        };
+        let storage = t.storage.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            let mut s = storage.lock().unwrap();
+            s.set_selection(&selected)?;
+            Ok::<_, StorageError>((
+                s.selected().to_vec(),
+                s.selected_indices(),
+                s.progress().clone(),
+                s.have().clone(),
+            ))
+        })
+        .await
+        .expect("storage task panicked");
+        let (selected, files, progress, have) = match res {
+            Ok(r) => r,
+            Err(e) => {
+                let text = format!("{}: changing files failed: {e}", t.meta.name);
+                self.emit(Event::Warning(text));
+                return;
+            }
+        };
+        t.selected = selected;
+        t.progress = progress;
+        t.changed = true;
+        match t.server_id {
+            Some(torrent_id) => self.outbox.push(ClientMessage::SetFiles {
+                torrent_id,
+                files,
+                have,
+            }),
+            None if t.add_sent => t.files_changed = true,
+            None => {}
+        }
+        self.queue_adds_if_online();
     }
 
     fn queue_adds_if_online(&mut self) {

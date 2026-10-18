@@ -115,6 +115,12 @@ mod tests {
             },
             ClientMessage::AddTorrent {
                 torrent_bytes: Bytes::from_static(b"d4:infod...ee"),
+                have: have.clone(),
+                files: vec![0, 2],
+            },
+            ClientMessage::SetFiles {
+                torrent_id: 7,
+                files: vec![1],
                 have,
             },
             ClientMessage::Ack {

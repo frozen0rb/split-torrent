@@ -6,11 +6,12 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Color32, RichText};
 use egui_extras::{Column, TableBuilder};
 use st_client_core::{
-    Client, ClientConfig, ConnectionState, Event, InfoHash, TorrentSnapshot, TorrentState,
+    Client, ClientConfig, ConnectionState, Event, InfoHash, Metainfo, TorrentSnapshot, TorrentState,
 };
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::UnboundedReceiver;
 
+use crate::files::{FilesDialog, Outcome, Purpose};
 use crate::fmt;
 use crate::settings::{self, SavedTorrent, Settings};
 
@@ -27,6 +28,7 @@ pub struct App {
     torrent_path: String,
     show_token: bool,
     messages: VecDeque<(String, bool)>,
+    files_dialog: Option<FilesDialog>,
     dirty: bool,
 }
 
@@ -52,6 +54,7 @@ impl App {
             torrent_path: String::new(),
             show_token: false,
             messages: VecDeque::new(),
+            files_dialog: None,
             dirty: false,
         };
         if app.settings.auto_connect {
@@ -87,7 +90,12 @@ impl App {
                 .map_err(|e| format!("{}: {e}", saved.torrent_file.display()))
                 .and_then(|bytes| {
                     client
-                        .add_torrent(bytes, &saved.download_dir, saved.paused)
+                        .add_torrent(
+                            bytes,
+                            &saved.download_dir,
+                            saved.paused,
+                            saved.selected.as_deref(),
+                        )
                         .map_err(|e| e.to_string())
                 });
             match res {
@@ -147,8 +155,13 @@ impl App {
                         self.buffer = Some((s.buffer_used, s.buffer_limit));
                     }
                     if let Some(i) = self.settings.find(&snap.info_hash) {
-                        if self.settings.torrents[i].paused != snap.paused {
-                            self.settings.torrents[i].paused = snap.paused;
+                        let saved = &mut self.settings.torrents[i];
+                        if saved.paused != snap.paused {
+                            saved.paused = snap.paused;
+                            self.dirty = true;
+                        }
+                        if saved.selected.as_ref() != Some(&snap.selected) {
+                            saved.selected = Some(snap.selected.clone());
                             self.dirty = true;
                         }
                     }
@@ -162,18 +175,40 @@ impl App {
         }
     }
 
-    fn add_torrent(&mut self) {
-        let Some(client) = &self.client else {
-            return;
-        };
+    /// Reads the chosen `.torrent` and opens the file selection; the
+    /// download starts once the selection is confirmed.
+    fn begin_add(&mut self) {
         let path = PathBuf::from(self.torrent_path.trim());
-        let dir = PathBuf::from(self.settings.download_dir.trim());
         let res = std::fs::read(&path)
             .map_err(|e| format!("{}: {e}", path.display()))
             .and_then(|bytes| {
-                let snap = client
-                    .add_torrent(bytes.clone(), &dir, false)
-                    .map_err(|e| e.to_string())?;
+                let meta = Metainfo::parse(&bytes).map_err(|e| e.to_string())?;
+                if self.settings.find(&meta.info_hash).is_some() {
+                    return Err("this torrent is already in the list".into());
+                }
+                Ok((bytes, meta))
+            });
+        match res {
+            Ok((torrent_bytes, meta)) => {
+                let purpose = Purpose::Add {
+                    torrent_bytes,
+                    download_dir: PathBuf::from(self.settings.download_dir.trim()),
+                };
+                self.files_dialog = Some(FilesDialog::new(&meta, purpose, None));
+            }
+            Err(e) => self.message(format!("Cannot add torrent: {e}"), true),
+        }
+    }
+
+    fn add_torrent(&mut self, bytes: Vec<u8>, dir: PathBuf, selected: Vec<bool>) {
+        let Some(client) = &self.client else {
+            self.message("Cannot add torrent: not connected", true);
+            return;
+        };
+        let res = client
+            .add_torrent(bytes.clone(), &dir, false, Some(&selected))
+            .map_err(|e| e.to_string())
+            .and_then(|snap| {
                 let copy = settings::store_torrent_copy(
                     &settings::torrents_dir(),
                     &snap.info_hash,
@@ -191,12 +226,69 @@ impl App {
                     torrent_file: copy,
                     download_dir: dir,
                     paused: false,
+                    selected: Some(selected),
                 });
                 self.snapshots.insert(snap.info_hash, snap);
                 self.torrent_path.clear();
                 self.dirty = true;
             }
             Err(e) => self.message(format!("Cannot add torrent: {e}"), true),
+        }
+    }
+
+    fn open_files(&mut self, ih: InfoHash) {
+        let Some(i) = self.settings.find(&ih) else {
+            return;
+        };
+        let saved = &self.settings.torrents[i];
+        let meta = std::fs::read(&saved.torrent_file)
+            .map_err(|e| format!("{}: {e}", saved.torrent_file.display()))
+            .and_then(|b| Metainfo::parse(&b).map_err(|e| e.to_string()));
+        match meta {
+            Ok(meta) => {
+                let selected = self
+                    .snapshots
+                    .get(&ih)
+                    .map(|s| s.selected.clone())
+                    .or_else(|| saved.selected.clone());
+                self.files_dialog = Some(FilesDialog::new(&meta, Purpose::Edit, selected));
+            }
+            Err(e) => self.message(format!("{}: {e}", saved.name), true),
+        }
+    }
+
+    fn set_files(&mut self, ih: InfoHash, selected: Vec<bool>) {
+        if let Some(c) = &self.client {
+            c.set_files(ih, selected.clone());
+        }
+        if let Some(i) = self.settings.find(&ih) {
+            self.settings.torrents[i].selected = Some(selected);
+            self.dirty = true;
+        }
+    }
+
+    fn files_dialog_ui(&mut self, ctx: &egui::Context) {
+        let Some(d) = self.files_dialog.as_mut() else {
+            return;
+        };
+        let live = match d.purpose {
+            Purpose::Edit => self.snapshots.get(&d.info_hash),
+            Purpose::Add { .. } => None,
+        };
+        let live = live.map(|s| (s.selected.as_slice(), s.file_bytes_have.as_slice()));
+        match d.show(ctx, live) {
+            Outcome::Open => {}
+            Outcome::Cancel => self.files_dialog = None,
+            Outcome::Confirm => {
+                let d = self.files_dialog.take().expect("open");
+                match d.purpose {
+                    Purpose::Add {
+                        torrent_bytes,
+                        download_dir,
+                    } => self.add_torrent(torrent_bytes, download_dir, d.selected),
+                    Purpose::Edit => self.set_files(d.info_hash, d.selected),
+                }
+            }
         }
     }
 
@@ -344,11 +436,12 @@ impl App {
             "Choose a .torrent file and a download folder"
         };
         if ui
-            .add_enabled(can_add, egui::Button::new("Add torrent"))
+            .add_enabled(can_add, egui::Button::new("Add torrent…"))
             .on_disabled_hover_text(hint)
+            .on_hover_text("Choose the files to download, then start")
             .clicked()
         {
-            self.add_torrent();
+            self.begin_add();
         }
     }
 
@@ -404,14 +497,14 @@ impl App {
             .striped(true)
             .resizable(true)
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-            .column(Column::initial(230.0).at_least(120.0).clip(true))
+            .column(Column::initial(200.0).at_least(120.0).clip(true))
             .column(Column::initial(80.0))
             .column(Column::initial(150.0))
             .column(Column::initial(130.0).clip(true))
             .column(Column::initial(85.0))
             .column(Column::initial(85.0))
             .column(Column::initial(50.0))
-            .column(Column::remainder().at_least(150.0))
+            .column(Column::remainder().at_least(270.0))
             .header(22.0, |mut h| {
                 for title in [
                     "Name",
@@ -446,6 +539,9 @@ impl App {
                                 row.col(|_| {});
                             }
                             row.col(|ui| {
+                                if ui.button("Files…").clicked() {
+                                    action = Some((ih, Action::Files));
+                                }
                                 if ui.button("Remove").clicked() {
                                     action = Some((ih, Action::Remove(false)));
                                 }
@@ -453,7 +549,13 @@ impl App {
                             return;
                         };
                         row.col(|ui| {
-                            ui.label(fmt::bytes(s.total_length));
+                            let size = ui.label(fmt::bytes(s.bytes_wanted));
+                            if s.bytes_wanted != s.total_length {
+                                size.on_hover_text(format!(
+                                    "Selected files; whole torrent {}",
+                                    fmt::bytes(s.total_length)
+                                ));
+                            }
                         });
                         row.col(|ui| {
                             ui.add(
@@ -463,9 +565,9 @@ impl App {
                             .on_hover_text(format!(
                                 "{} of {} pieces, {} of {}",
                                 s.pieces_have,
-                                s.piece_count,
+                                s.pieces_wanted,
                                 fmt::bytes(s.bytes_have),
-                                fmt::bytes(s.total_length)
+                                fmt::bytes(s.bytes_wanted)
                             ));
                         });
                         let (text, color) = self.status_text(&s);
@@ -490,6 +592,13 @@ impl App {
                                     action = Some((ih, Action::Pause(!paused)));
                                 }
                             }
+                            if ui
+                                .button("Files…")
+                                .on_hover_text("Choose which files to download")
+                                .clicked()
+                            {
+                                action = Some((ih, Action::Files));
+                            }
                             ui.menu_button("Remove", |ui| {
                                 if ui.button("Keep downloaded files").clicked() {
                                     action = Some((ih, Action::Remove(false)));
@@ -513,6 +622,7 @@ impl App {
             Some((ih, Action::Pause(p))) => self.set_paused(ih, p),
             Some((ih, Action::Remove(delete))) => self.remove(ih, delete),
             Some((_, Action::Open(dir))) => open_folder(&dir),
+            Some((ih, Action::Files)) => self.open_files(ih),
             None => {}
         }
     }
@@ -560,6 +670,7 @@ enum Action {
     Pause(bool),
     Remove(bool),
     Open(PathBuf),
+    Files,
 }
 
 fn parse_hex(s: &str) -> Option<InfoHash> {
@@ -608,6 +719,7 @@ impl eframe::App for App {
             .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(8.0))
             .show(ui, |ui| self.footer_ui(ui));
         egui::CentralPanel::default_margins().show(ui, |ui| self.torrents_ui(ui));
+        self.files_dialog_ui(&ui.ctx().clone());
 
         if self.dirty {
             if let Some(storage) = frame.storage_mut() {
