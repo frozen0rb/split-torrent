@@ -5,7 +5,6 @@ use anyhow::Context;
 use serde::{Deserialize, Deserializer};
 
 pub const DEFAULT_BUFFER_LIMIT: u64 = 384 * 1024 * 1024;
-pub const DEFAULT_MAX_INFLIGHT_PIECES: usize = 32;
 pub const DEFAULT_BT_PORT: u16 = 4240;
 
 /// Server configuration, usually loaded from TOML. All fields have defaults.
@@ -23,9 +22,9 @@ pub struct Config {
     /// RAM budget for partial and not-yet-ACKed pieces, e.g. `"384MiB"`.
     #[serde(deserialize_with = "de_size")]
     pub buffer_limit: u64,
-    /// Swarm downloads are throttled while this many pieces are partially
-    /// downloaded.
-    pub max_inflight_pieces: usize,
+    /// Deprecated and ignored: throttling on in-flight pieces could stall
+    /// downloads. Accepted so old config files still load.
+    pub max_inflight_pieces: Option<usize>,
     /// BitTorrent listen port (TCP). `0` picks a random port.
     pub bt_port: u16,
     pub dht: bool,
@@ -56,7 +55,7 @@ impl Default for Config {
             token: None,
             state_dir: PathBuf::from("/var/lib/st-server"),
             buffer_limit: DEFAULT_BUFFER_LIMIT,
-            max_inflight_pieces: DEFAULT_MAX_INFLIGHT_PIECES,
+            max_inflight_pieces: None,
             bt_port: DEFAULT_BT_PORT,
             dht: true,
             lsd: true,
@@ -90,10 +89,7 @@ impl Config {
             self.buffer_limit >= 16 * 1024 * 1024,
             "buffer_limit must be at least 16MiB"
         );
-        anyhow::ensure!(
-            self.max_inflight_pieces > 0,
-            "max_inflight_pieces must be > 0"
-        );
+        anyhow::ensure!(self.peer_limit > 0, "peer_limit must be > 0");
         if let Some(t) = &self.token {
             anyhow::ensure!(t.len() >= 16, "token must be at least 16 characters");
         }
@@ -183,5 +179,8 @@ mod tests {
         assert!(Config::from_toml("buffer_limit = \"1MiB\"").is_err());
         assert!(Config::from_toml("token = \"short\"").is_err());
         assert!(Config::from_toml("unknown_key = 1").is_err());
+        assert!(Config::from_toml("peer_limit = 0").is_err());
+        let c = Config::from_toml("max_inflight_pieces = 32").unwrap();
+        assert_eq!(c.max_inflight_pieces, Some(32));
     }
 }

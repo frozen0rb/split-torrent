@@ -190,7 +190,6 @@ fn server_config(dir: &Path, seed: SocketAddr) -> Config {
         token: Some("test-token-0123456789".into()),
         state_dir: dir.join("state"),
         buffer_limit: 16 * 1024 * 1024,
-        max_inflight_pieces: 4,
         bt_port: 0,
         dht: false,
         lsd: false,
@@ -680,5 +679,148 @@ async fn downloads_selected_files_and_follows_selection_changes() {
     );
     assert!(rest.contains(&shared[0]));
     assert!(rest.iter().all(|i| !only0.contains(i) || *i == shared[0]));
+    h.shutdown().await;
+}
+
+async fn seed_session(
+    dir: &Path,
+    torrent: &bytes::Bytes,
+    folder: &Path,
+) -> (Arc<Session>, SocketAddr) {
+    let session = Session::new_with_opts(
+        dir.to_path_buf(),
+        SessionOptions {
+            dht: None,
+            disable_trackers: true,
+            disable_local_service_discovery: true,
+            listen: Some(librqbit::ListenerOptions {
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                ipv4_only: true,
+                ..Default::default()
+            }),
+            ipv4_only: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let h = session
+        .add_torrent(
+            AddTorrent::from_bytes(torrent.clone()),
+            Some(AddTorrentOptions {
+                output_folder: Some(folder.to_str().unwrap().to_owned()),
+                overwrite: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_handle()
+        .unwrap();
+    h.wait_until_initialized().await.unwrap();
+    assert!(h.stats().finished);
+    let port = session.listen_addr().unwrap().port();
+    (session, SocketAddr::from(([127, 0, 0, 1], port)))
+}
+
+/// Regression: with several seeds librqbit has many pieces in flight at once
+/// (a 2 MiB request window per peer). That must not throttle the session
+/// while the client keeps up with ACKs. It used to: the throttle starved the
+/// in-flight pieces, which then never completed to release it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn many_inflight_pieces_do_not_stall_download() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("many");
+    std::fs::create_dir_all(&data).unwrap();
+    let mut content = vec![0u8; 32 * 1024 * 1024];
+    rand::rng().fill_bytes(&mut content);
+    std::fs::write(data.join("many.bin"), &content).unwrap();
+    let created = librqbit::create_torrent(
+        &data,
+        CreateTorrentOptions {
+            name: Some("many"),
+            trackers: vec![],
+            piece_length: Some(PIECE),
+        },
+        &librqbit::spawn_utils::BlockingSpawner::new(2),
+    )
+    .await
+    .unwrap();
+    let torrent = created.as_bytes().unwrap();
+    let piece_count = content.len().div_ceil(PIECE as usize);
+
+    let mut seeds = Vec::new();
+    for i in 0..4 {
+        let d = dir.path().join(format!("seed{i}"));
+        std::fs::create_dir_all(&d).unwrap();
+        seeds.push(seed_session(&d, &torrent, &created.output_folder).await);
+    }
+    let mut cfg = server_config(dir.path(), seeds[0].1);
+    cfg.initial_peers = seeds.iter().map(|s| s.1).collect();
+    cfg.buffer_limit = 64 * 1024 * 1024;
+    let server = Server::bind(cfg).await.unwrap();
+    let (addr, fp, token) = (
+        server.local_addr(),
+        server.fingerprint().to_owned(),
+        server.token().to_owned(),
+    );
+    let h = server.spawn();
+    let pool = h.engine.pool().clone();
+    let engine = h.engine.clone();
+    let (mut c, _) = connect(addr, &fp, &token).await;
+    c.send(ClientMessage::AddTorrent {
+        torrent_bytes: torrent.clone(),
+        have: Bitfield::default(),
+        files: vec![0],
+    })
+    .await
+    .unwrap();
+
+    let started = std::time::Instant::now();
+    let mut done = std::collections::BTreeSet::new();
+    let mut max_inflight = 0;
+    let mut throttled = false;
+    let run = async {
+        while done.len() < piece_count {
+            let m = c.next().await.unwrap().unwrap();
+            max_inflight = max_inflight.max(pool.stats().inflight_pieces);
+            throttled |= engine.throttled();
+            match m {
+                ServerMessage::Piece {
+                    torrent_id,
+                    index,
+                    data,
+                    ..
+                } => {
+                    let start = index as usize * PIECE as usize;
+                    assert_eq!(&data[..], &content[start..start + data.len()]);
+                    c.send(ClientMessage::Ack { torrent_id, index })
+                        .await
+                        .unwrap();
+                    done.insert(index);
+                }
+                ServerMessage::Error { msg, .. } => panic!("server error: {msg}"),
+                _ => {}
+            }
+        }
+    };
+    // Localhost transfers 32 MiB in a few seconds; throttled to 16 KiB/s it
+    // would take over half an hour.
+    tokio::time::timeout(Duration::from_secs(30), run)
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "download stalled: {}/{piece_count} pieces after {:?}, {:?}, throttled {}",
+                done.len(),
+                started.elapsed(),
+                pool.stats(),
+                engine.throttled()
+            )
+        });
+    assert!(
+        max_inflight >= seeds.len(),
+        "every seed should hold a piece in flight, saw {max_inflight}"
+    );
+    assert!(!throttled, "an ACKing client must never be throttled");
     h.shutdown().await;
 }

@@ -8,10 +8,15 @@
 //!
 //! Backpressure has two levels:
 //! - soft: [`BufferPool::pressure`] tells the engine to throttle swarm
-//!   downloads once the buffer is mostly full or too many pieces are in flight;
+//!   downloads while complete pieces wait for the client's ACK. Only the
+//!   client can relieve it, never the swarm: throttling on partial pieces
+//!   would starve exactly the pieces whose completion is needed to recover;
 //! - hard: allocating a new partial piece blocks (librqbit calls storage from
 //!   `block_in_place`) while the byte limit is exceeded and there are complete
 //!   pieces whose ACK will free memory.
+//!
+//! Partial-piece memory is bounded by the per-torrent peer limit instead (see
+//! [`auto_peer_limit`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -39,19 +44,34 @@ struct PoolState {
     complete_bytes: u64,
 }
 
+/// librqbit 9 keeps up to 128 blocks (2 MiB) requested per peer and reserves
+/// a new piece whenever the window has room, so each peer holds this many
+/// partial pieces at most.
+pub fn partial_pieces_per_peer(piece_length: u32) -> u64 {
+    const REQUEST_WINDOW: u64 = 128 * 16 * 1024;
+    REQUEST_WINDOW.div_ceil(u64::from(piece_length.max(1))) + 1
+}
+
+/// Peer limit for one torrent so its partial pieces fit in half the buffer,
+/// leaving the other half for complete pieces awaiting ACK. Never above
+/// `configured`, never below 2.
+pub fn auto_peer_limit(buffer_limit: u64, piece_length: u32, configured: usize) -> usize {
+    let per_peer = partial_pieces_per_peer(piece_length) * u64::from(piece_length.max(1));
+    let fit = usize::try_from((buffer_limit / 2) / per_peer).unwrap_or(usize::MAX);
+    fit.max(2).min(configured.max(1))
+}
+
 pub struct BufferPool {
     limit: u64,
-    max_inflight: usize,
     state: Mutex<PoolState>,
     freed: Condvar,
     changed: tokio::sync::Notify,
 }
 
 impl BufferPool {
-    pub fn new(limit: u64, max_inflight_pieces: usize) -> Arc<Self> {
+    pub fn new(limit: u64) -> Arc<Self> {
         Arc::new(Self {
             limit,
-            max_inflight: max_inflight_pieces.max(1),
             state: Mutex::new(PoolState::default()),
             freed: Condvar::new(),
             changed: tokio::sync::Notify::new(),
@@ -60,10 +80,6 @@ impl BufferPool {
 
     pub fn limit(&self) -> u64 {
         self.limit
-    }
-
-    pub fn max_inflight(&self) -> usize {
-        self.max_inflight
     }
 
     pub fn stats(&self) -> PoolStats {
@@ -81,16 +97,14 @@ impl BufferPool {
         self.state.lock().used
     }
 
-    /// Soft backpressure with hysteresis: turns on at 75% of the limit or at
-    /// `max_inflight` partial pieces, turns off below 50% and below the
-    /// in-flight cap.
+    /// Soft backpressure with hysteresis on the unACKed backlog: turns on
+    /// when complete pieces fill half the limit, off below a quarter.
     pub fn pressure(&self, currently_on: bool) -> bool {
         let s = self.state.lock();
-        let inflight_full = s.inflight_pieces >= self.max_inflight;
         if currently_on {
-            inflight_full || s.used >= self.limit / 2
+            s.complete_bytes >= self.limit / 4
         } else {
-            inflight_full || s.used >= self.limit - self.limit / 4
+            s.complete_bytes >= self.limit / 2
         }
     }
 
@@ -102,7 +116,7 @@ impl BufferPool {
     /// Reserves memory for a new partial piece. Blocks while the limit would
     /// be exceeded and some complete pieces can still be freed by an ACK.
     /// Without complete pieces nothing could ever free memory, so the
-    /// reservation goes through (bounded by soft backpressure).
+    /// reservation goes through (bounded by the peer limit).
     fn reserve_partial(&self, len: u64, cancelled: &AtomicBool) -> anyhow::Result<()> {
         let mut s = self.state.lock();
         loop {
@@ -573,7 +587,7 @@ mod tests {
 
     #[test]
     fn write_read_complete_ack_frees_memory() {
-        let pool = BufferPool::new(10 * u64::from(PL), 8);
+        let pool = BufferPool::new(10 * u64::from(PL));
         let buf = TorrentBuffer::new(
             pool.clone(),
             geom(3, 100),
@@ -611,7 +625,7 @@ mod tests {
 
     #[test]
     fn write_spanning_two_pieces() {
-        let pool = BufferPool::new(10 * u64::from(PL), 8);
+        let pool = BufferPool::new(10 * u64::from(PL));
         let buf = TorrentBuffer::new(
             pool.clone(),
             geom(3, PL),
@@ -628,7 +642,7 @@ mod tests {
 
     #[test]
     fn pieces_client_has_are_freed_on_completion() {
-        let pool = BufferPool::new(10 * u64::from(PL), 8);
+        let pool = BufferPool::new(10 * u64::from(PL));
         let mut have = Bitfield::new(4);
         have.set(1, true);
         let buf = TorrentBuffer::new(pool.clone(), geom(4, PL), have, Bitfield::full(4));
@@ -640,7 +654,7 @@ mod tests {
 
     #[test]
     fn merge_have_frees_and_lost_pieces_detected() {
-        let pool = BufferPool::new(10 * u64::from(PL), 8);
+        let pool = BufferPool::new(10 * u64::from(PL));
         let buf = TorrentBuffer::new(
             pool.clone(),
             geom(4, PL),
@@ -676,7 +690,7 @@ mod tests {
 
     #[test]
     fn unwanted_pieces_are_not_kept_and_do_not_block_finish() {
-        let pool = BufferPool::new(10 * u64::from(PL), 8);
+        let pool = BufferPool::new(10 * u64::from(PL));
         let buf = TorrentBuffer::new(
             pool.clone(),
             geom(4, PL),
@@ -699,7 +713,7 @@ mod tests {
 
     #[test]
     fn deselecting_frees_complete_pieces_and_stale_partials() {
-        let pool = BufferPool::new(10 * u64::from(PL), 8);
+        let pool = BufferPool::new(10 * u64::from(PL));
         let buf = TorrentBuffer::new(
             pool.clone(),
             geom(4, PL),
@@ -737,7 +751,7 @@ mod tests {
 
     #[test]
     fn restart_adopts_complete_pieces() {
-        let pool = BufferPool::new(10 * u64::from(PL), 8);
+        let pool = BufferPool::new(10 * u64::from(PL));
         let old = TorrentBuffer::new(
             pool.clone(),
             geom(4, PL),
@@ -761,7 +775,7 @@ mod tests {
 
     #[test]
     fn reset_unsent_resends_unacked() {
-        let pool = BufferPool::new(10 * u64::from(PL), 8);
+        let pool = BufferPool::new(10 * u64::from(PL));
         let buf = TorrentBuffer::new(pool, geom(4, PL), Bitfield::new(4), Bitfield::full(4));
         for i in [2, 0] {
             fill(&buf, i);
@@ -777,32 +791,31 @@ mod tests {
     }
 
     #[test]
-    fn soft_pressure_has_hysteresis_and_inflight_cap() {
-        let pool = BufferPool::new(8 * u64::from(PL), 3);
+    fn soft_pressure_follows_unacked_backlog_with_hysteresis() {
+        let pool = BufferPool::new(8 * u64::from(PL));
         let buf = TorrentBuffer::new(
             pool.clone(),
             geom(8, PL),
             Bitfield::new(8),
             Bitfield::full(8),
         );
-        fill(&buf, 0);
-        fill(&buf, 1);
+        // A buffer full of partial pieces must not throttle: only finishing
+        // them can free memory.
+        for i in 0..8 {
+            fill(&buf, i);
+        }
+        assert_eq!(pool.used(), pool.limit());
         assert!(!pool.pressure(false));
-        fill(&buf, 2);
-        assert!(pool.pressure(false), "3 in-flight pieces hit the cap");
         for i in 0..3 {
             buf.piece_completed(i);
         }
         assert!(!pool.pressure(false));
-        for i in 3..6 {
-            fill(&buf, i);
-            buf.piece_completed(i);
-        }
-        // 6/8 used = 75%
+        buf.piece_completed(3);
+        // 4/8 complete = 50%
         assert!(pool.pressure(false));
         buf.ack(0);
         buf.ack(1);
-        // 4/8 used: still on (needs < 50% to turn off), would not turn on
+        // 2/8: still on (needs < 25% to turn off), would not turn on
         assert!(pool.pressure(true));
         assert!(!pool.pressure(false));
         buf.ack(2);
@@ -810,8 +823,22 @@ mod tests {
     }
 
     #[test]
+    fn auto_peer_limit_fits_partials_in_half_the_buffer() {
+        const MIB: u64 = 1 << 20;
+        // 4 MiB pieces: 2 partial pieces (8 MiB) per peer.
+        assert_eq!(partial_pieces_per_peer(4 << 20), 2);
+        assert_eq!(auto_peer_limit(768 * MIB, 4 << 20, 64), 48);
+        assert_eq!(auto_peer_limit(384 * MIB, 4 << 20, 64), 24);
+        // 16 KiB pieces: the configured limit wins.
+        assert_eq!(auto_peer_limit(384 * MIB, 16 << 10, 64), 64);
+        // Huge pieces still allow two peers.
+        assert_eq!(auto_peer_limit(64 * MIB, 16 << 20, 64), 2);
+        assert_eq!(auto_peer_limit(64 * MIB, 16 << 20, 1), 1);
+    }
+
+    #[test]
     fn hard_limit_blocks_until_ack() {
-        let pool = BufferPool::new(2 * u64::from(PL), 8);
+        let pool = BufferPool::new(2 * u64::from(PL));
         let buf = TorrentBuffer::new(
             pool.clone(),
             geom(4, PL),
@@ -845,7 +872,7 @@ mod tests {
 
     #[test]
     fn hard_limit_does_not_deadlock_without_complete_pieces() {
-        let pool = BufferPool::new(u64::from(PL), 8);
+        let pool = BufferPool::new(u64::from(PL));
         let buf = TorrentBuffer::new(
             pool.clone(),
             geom(4, PL),
@@ -859,7 +886,7 @@ mod tests {
 
     #[test]
     fn close_frees_everything_and_unblocks_writers() {
-        let pool = BufferPool::new(u64::from(PL), 8);
+        let pool = BufferPool::new(u64::from(PL));
         let buf = TorrentBuffer::new(
             pool.clone(),
             geom(4, PL),
@@ -873,13 +900,13 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         buf.close();
         assert!(writer.join().unwrap().is_err());
-        assert_eq!(pool.stats(), BufferPool::new(u64::from(PL), 8).stats());
+        assert_eq!(pool.stats(), BufferPool::new(u64::from(PL)).stats());
         assert!(buf.write(0, &[1]).is_err());
     }
 
     #[test]
     fn drop_returns_memory_to_pool() {
-        let pool = BufferPool::new(10 * u64::from(PL), 8);
+        let pool = BufferPool::new(10 * u64::from(PL));
         let buf = TorrentBuffer::new(
             pool.clone(),
             geom(4, PL),
@@ -896,7 +923,7 @@ mod tests {
 
     #[test]
     fn finished_when_all_done() {
-        let pool = BufferPool::new(10 * u64::from(PL), 8);
+        let pool = BufferPool::new(10 * u64::from(PL));
         let mut have = Bitfield::new(2);
         have.set(0, true);
         let buf = TorrentBuffer::new(pool, geom(2, 10), have, Bitfield::full(2));
