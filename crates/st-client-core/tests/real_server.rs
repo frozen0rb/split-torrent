@@ -198,7 +198,6 @@ fn server_config(tmp: &Path, seed: &Seed) -> Config {
         token: Some("client-core-test-token".into()),
         state_dir: tmp.join("server-state"),
         buffer_limit: 16 * 1024 * 1024,
-        max_inflight_pieces: 2,
         bt_port: 0,
         dht: false,
         lsd: false,

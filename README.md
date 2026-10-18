@@ -82,9 +82,8 @@ all of them. The ones you are most likely to change:
 | `token` | generated | Shared secret; if unset, a random one is stored in `state_dir/token` |
 | `state_dir` | `/var/lib/st-server` | TLS certificate, key and generated token |
 | `buffer_limit` | `384MiB` | RAM for pieces in flight and pieces waiting for ACK |
-| `max_inflight_pieces` | `32` | Downloads are throttled while this many pieces are partial |
 | `bt_port` | `4240` | BitTorrent TCP port for incoming peers |
-| `peer_limit` | `64` | Max peers per torrent |
+| `peer_limit` | `64` | Max peers per torrent; lowered automatically for large pieces (see [Memory tuning](#memory-tuning)) |
 | `download_limit` / `upload_limit` | `0` (unlimited) | Swarm rate limits, e.g. `"10MiB"` |
 | `seed` | `true` | Serve pieces that are still in RAM to other peers |
 | `ipv6` | auto | BitTorrent over IPv6 as well as IPv4; see [IPv4-only hosts](#ipv4-only-hosts) |
@@ -189,27 +188,38 @@ How the buffer is used:
 
 - Every piece that is being downloaded, or verified and waiting for the
   client's ACK, takes its full piece size in RAM.
-- **Soft limit:** at 75% of `buffer_limit`, or when `max_inflight_pieces`
-  pieces are partial, swarm downloads are throttled to one 16 KiB block per
-  second. Full speed resumes once usage falls below 50%.
-- **Hard limit:** a new piece cannot be started while the buffer is full; the
-  download waits until the client acknowledges pieces. So a slow or offline
-  client stalls the download instead of growing memory.
+- **Partial pieces** are bounded by the peer limit: librqbit keeps up to
+  2 MiB of requests per peer, so each peer holds about `2MiB / piece size + 1`
+  partial pieces. Each torrent's peer limit is lowered from `peer_limit` so
+  its partial pieces fit in half of `buffer_limit` (at least 2 peers). For
+  example, `384MiB` with 4 MiB pieces allows 24 peers.
+- **Soft limit:** when verified pieces waiting for the client's ACK fill half
+  of `buffer_limit`, swarm downloads are throttled to one 16 KiB block per
+  second. Full speed resumes once they fall below a quarter. Only the client
+  can relieve this, so a client that keeps up with ACKs is never throttled.
+- **Hard limit:** a new piece cannot be started while the buffer is full and
+  there are pieces waiting for ACK; the download waits until the client
+  acknowledges pieces. So a slow or offline client stalls the download
+  instead of growing memory.
 - Torrents whose piece size is more than a quarter of `buffer_limit` are
   rejected.
 
+The server warns at startup if `buffer_limit + 256MiB` exceeds the cgroup
+memory limit (systemd `MemoryMax`), and logs a `buffer summary` plus one
+`torrent summary` per torrent every 30 seconds.
+
 Suggested settings:
 
-| Server RAM | `buffer_limit` | `MemoryMax` | `max_inflight_pieces` | `peer_limit` |
-|---|---|---|---|---|
-| 512 MB | `160MiB` | `400M` | 16 | 32 |
-| 1 GB (default) | `384MiB` | `640M` | 32 | 64 |
-| 2 GB | `1GiB` | `1400M` | 64 | 100 |
+| Server RAM | `buffer_limit` | `MemoryMax` | `peer_limit` |
+|---|---|---|---|
+| 512 MB | `160MiB` | `400M` | 32 |
+| 1 GB (default) | `384MiB` | `640M` | 64 |
+| 2 GB | `1GiB` | `1400M` | 100 |
 
 A bigger buffer helps when the client link is slower or less stable than the
-swarm: more pieces can wait for the client without stalling the download. With
-very large pieces (8–16 MiB) lower `max_inflight_pieces` so partial pieces do
-not crowd out pieces waiting for ACK.
+swarm: more pieces can wait for the client without stalling the download, and
+torrents with large pieces get more peers. `max_inflight_pieces` from older
+configs is ignored (with a warning).
 
 ## Known limitations
 

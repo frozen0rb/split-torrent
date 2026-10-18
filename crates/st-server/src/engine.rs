@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,7 +18,7 @@ use parking_lot::Mutex;
 use st_protocol::{Bitfield, ErrorCode, ServerMessage, TorrentId, TorrentState};
 use tokio_util::sync::CancellationToken;
 
-use crate::buffer::{BufferPool, Geometry, TorrentBuffer};
+use crate::buffer::{auto_peer_limit, BufferPool, Geometry, TorrentBuffer};
 use crate::storage::RamStorageFactory;
 use crate::Config;
 
@@ -28,6 +28,10 @@ const THROTTLED_BPS: u32 = 16 * 1024;
 /// Partial pieces of deselected files that librqbit stopped writing are
 /// freed after this long.
 const STALE_PARTIAL: Duration = Duration::from_secs(30);
+/// Interval of the periodic buffer/torrent summary in the log.
+const DIAG_INTERVAL: Duration = Duration::from_secs(30);
+/// Process memory besides the buffer (librqbit, TLS, allocator slack).
+const MEMORY_OVERHEAD: u64 = 256 * 1024 * 1024;
 
 pub type ConnId = u64;
 
@@ -152,6 +156,7 @@ pub struct Engine {
     peer_limit: usize,
     disable_trackers: bool,
     base_download: Option<NonZeroU32>,
+    throttled: AtomicBool,
     next_conn: AtomicU64,
 }
 
@@ -168,6 +173,23 @@ fn nz(v: u64) -> Option<NonZeroU32> {
 
 impl Engine {
     pub async fn new(config: &Config, cancel: CancellationToken) -> anyhow::Result<Arc<Self>> {
+        if let Some(n) = config.max_inflight_pieces {
+            tracing::warn!(
+                max_inflight_pieces = n,
+                "max_inflight_pieces is deprecated and ignored; the per-torrent peer \
+                 limit is now derived from buffer_limit and the piece size"
+            );
+        }
+        if let Some(max) = cgroup_memory_max() {
+            if config.buffer_limit + MEMORY_OVERHEAD > max {
+                tracing::warn!(
+                    buffer_limit = config.buffer_limit,
+                    memory_max = max,
+                    "buffer_limit plus ~256MiB overhead exceeds the cgroup memory limit \
+                     (systemd MemoryMax); the server may be OOM-killed"
+                );
+            }
+        }
         let base_download = nz(config.download_limit);
         let ipv6 = crate::net::resolve_ipv6(config.ipv6)?;
         let bt_ip: std::net::IpAddr = if ipv6 {
@@ -208,12 +230,13 @@ impl Engine {
             .context("starting BitTorrent session")?;
         let engine = Arc::new(Self {
             session,
-            pool: BufferPool::new(config.buffer_limit, config.max_inflight_pieces),
+            pool: BufferPool::new(config.buffer_limit),
             torrents: Mutex::new(Registry::default()),
             initial_peers: config.initial_peers.clone(),
             peer_limit: config.peer_limit,
             disable_trackers: !config.trackers,
             base_download,
+            throttled: AtomicBool::new(false),
             next_conn: AtomicU64::new(1),
         });
         tokio::spawn(engine.clone().backpressure_loop());
@@ -222,6 +245,11 @@ impl Engine {
 
     pub fn pool(&self) -> &Arc<BufferPool> {
         &self.pool
+    }
+
+    /// Whether swarm downloads are currently throttled by backpressure.
+    pub fn throttled(&self) -> bool {
+        self.throttled.load(Ordering::Relaxed)
     }
 
     pub fn bt_listen_addr(&self) -> Option<SocketAddr> {
@@ -236,11 +264,13 @@ impl Engine {
         self.torrents.lock().by_id.get(&id).cloned()
     }
 
-    /// Throttles the whole session while the buffer is under pressure, and
-    /// frees abandoned partial pieces of deselected files.
+    /// Throttles the whole session while the buffer is under pressure, frees
+    /// abandoned partial pieces of deselected files and periodically logs a
+    /// summary.
     async fn backpressure_loop(self: Arc<Self>) {
         let mut on = false;
         let cancel = self.session.cancellation_token().clone();
+        let mut next_diag = tokio::time::Instant::now() + DIAG_INTERVAL;
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => return,
@@ -248,7 +278,7 @@ impl Engine {
                 _ = tokio::time::sleep(Duration::from_millis(500)) => {}
             }
             let entries: Vec<_> = self.torrents.lock().by_id.values().cloned().collect();
-            for e in entries {
+            for e in &entries {
                 let n = e.buffer().drop_stale(STALE_PARTIAL);
                 if n > 0 {
                     tracing::debug!(torrent = e.id, pieces = n, "freed stale deselected pieces");
@@ -257,9 +287,14 @@ impl Engine {
             let p = self.pool.pressure(on);
             if p != on {
                 on = p;
+                self.throttled.store(on, Ordering::Relaxed);
                 let stats = self.pool.stats();
                 if on {
-                    tracing::info!(?stats, "buffer under pressure, throttling downloads");
+                    tracing::info!(
+                        ?stats,
+                        "unACKed pieces fill half the buffer, throttling downloads until the \
+                         client catches up"
+                    );
                     self.session
                         .ratelimits
                         .set_download_bps(NonZeroU32::new(THROTTLED_BPS));
@@ -268,6 +303,52 @@ impl Engine {
                     self.session.ratelimits.set_download_bps(self.base_download);
                 }
             }
+            if tokio::time::Instant::now() >= next_diag {
+                next_diag += DIAG_INTERVAL;
+                if !entries.is_empty() {
+                    self.log_diagnostics(&entries);
+                }
+            }
+        }
+    }
+
+    fn log_diagnostics(&self, entries: &[Arc<TorrentEntry>]) {
+        let stats = self.pool.stats();
+        tracing::info!(
+            used = stats.used,
+            limit = stats.limit,
+            partial_pieces = stats.inflight_pieces,
+            partial_bytes = stats.inflight_bytes,
+            unacked_bytes = stats.complete_bytes,
+            throttled = self.throttled(),
+            torrents = entries.len(),
+            "buffer summary"
+        );
+        for e in entries {
+            let ServerMessage::Status {
+                state,
+                peers,
+                down_speed,
+                pieces_done,
+                pieces_total,
+                ..
+            } = self.status(e)
+            else {
+                continue;
+            };
+            let buffer = e.buffer();
+            tracing::info!(
+                torrent = e.id,
+                name = %e.name,
+                ?state,
+                peers,
+                down_speed,
+                pieces_done,
+                pieces_total,
+                buffered_bytes = buffer.buffered_bytes(),
+                owner = ?e.owner(),
+                "torrent summary"
+            );
         }
     }
 
@@ -435,13 +516,21 @@ impl Engine {
         }
         let only_files = Some(entry.only_files(&have, &selected));
         let paused = entry.state.lock().user_paused;
+        let peer_limit =
+            auto_peer_limit(self.pool.limit(), entry.geom.piece_length, self.peer_limit);
+        tracing::info!(
+            torrent = entry.id,
+            piece_length = entry.geom.piece_length,
+            peer_limit,
+            "starting torrent"
+        );
         let opts = AddTorrentOptions {
             paused,
             only_files,
             overwrite: true,
             disable_trackers: self.disable_trackers,
             initial_peers: (!self.initial_peers.is_empty()).then(|| self.initial_peers.clone()),
-            peer_limit: Some(self.peer_limit),
+            peer_limit: Some(peer_limit),
             storage_factory: Some(librqbit::storage::StorageFactoryExt::boxed(
                 RamStorageFactory::new(buffer),
             )),
@@ -594,6 +683,14 @@ impl Engine {
         }
         self.session.stop().await;
     }
+}
+
+/// `memory.max` of this process's cgroup (v2), e.g. systemd `MemoryMax`.
+fn cgroup_memory_max() -> Option<u64> {
+    let cgroups = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let path = cgroups.lines().find_map(|l| l.strip_prefix("0::"))?;
+    let max = std::fs::read_to_string(format!("/sys/fs/cgroup{path}/memory.max")).ok()?;
+    max.trim().parse().ok()
 }
 
 struct ParsedTorrent {
