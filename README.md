@@ -32,7 +32,8 @@ How a session works:
 
 1. The client opens one TLS connection to `server:7443`, checks the server
    certificate against the pinned SHA-256 fingerprint and sends the token.
-2. It sends the `.torrent` file plus a bitfield of the pieces it already has.
+2. It sends the `.torrent` file, the files the user selected and a bitfield
+   of the pieces it already has. The selection can be changed at any time.
 3. The server downloads the missing pieces into RAM and sends each verified
    piece; the client writes it, re-checks it, saves its state and sends an ACK;
    the server frees the piece.
@@ -224,6 +225,10 @@ not crowd out pieces waiting for ACK.
   by librqbit. Set `seed = false` to turn uploading off entirely.
 - **If the client loses pieces it had acknowledged** (e.g. its state file was
   deleted), the server restarts the torrent and downloads them again.
+- **Adding a file to the selection may restart the torrent on the server**
+  when the client needs a piece again that librqbit already verified and the
+  server freed (typically the piece shared with a neighbouring file).
+  Buffered complete pieces are kept; partial ones are downloaded again.
 - One client owns a torrent at a time; adding the same torrent from a second
   connection takes it over.
 
@@ -261,16 +266,29 @@ when you closed the app, it reconnects on the next start.
 ### Adding torrents
 
 Pick a `.torrent` file with **Browse…** (or drop it on the window), choose
-the **Download folder** and press **Add torrent**. A private copy of the
-`.torrent` is kept next to the settings, so the original can be deleted.
+the **Download folder** and press **Add torrent…**. A dialog lists the
+torrent's files as a tree with sizes; tick the files you want (**Select
+all** / **Select none**, or a whole folder at once) and press **Download**.
+Nothing is downloaded before that. A private copy of the `.torrent` is kept
+next to the settings, so the original can be deleted.
+
+![File selection](docs/images/file-selection.png)
 
 Single-file torrents are written to `<folder>\<name>`, multi-file torrents
-to `<folder>\<name>\…`. All files are created at full size up front, and
-every piece is written straight to its offset. Names from the torrent are
+to `<folder>\<name>\…`. Only the selected files are created, at full size
+up front, and every piece is written straight to its offset. Names from the torrent are
 sanitized (no `..`, drive letters, reserved names like `CON`, or characters
 Windows forbids).
 
-The list shows per torrent: size, progress, status, the server's download
+**Files…** on a torrent in the list opens the same dialog, with per-file
+progress, while it downloads, is paused or is complete. Newly ticked files
+are fetched; unticked files stop downloading, and the data already on disk is
+kept (it is not deleted). A piece that spans a selected and an unselected
+file is downloaded whole, but only the selected part is written; if the other
+file is selected later, that piece is fetched once more. The selection is
+saved with the settings and in `.st-state`.
+
+The list shows per torrent: size and progress of the selected files, status, the server's download
 speed from the swarm, the transfer speed from the server to this PC, and the
 number of peers. The footer shows how much of the server's RAM buffer is in
 use.
@@ -295,6 +313,7 @@ scratch.
   again later resumes it.
 - **Remove → Delete downloaded files** also deletes the files and the
   `.st-state`.
+- **Files…** changes which files are downloaded (see above).
 - **Open** opens the download folder.
 
 ### Trying the client without a server
@@ -312,12 +331,13 @@ cargo test --workspace
 ```
 
 `crates/st-client-core/tests/` covers the client against a mock server
-(resume after disconnect, corrupt piece, pause/resume/remove, wrong
-fingerprint, bad token) and against a real in-process `st-server` with a
-librqbit seed (download, client restart mid-download, byte-for-byte check).
+(resume after disconnect, corrupt piece, pause/resume/remove, file selection,
+wrong fingerprint, bad token) and against a real in-process `st-server` with
+a librqbit seed (download, client restart mid-download, a file subset with
+the selection changed mid-download, byte-for-byte checks).
 `crates/st-server/tests/swarm.rs` runs the server against a local librqbit seed
 (TLS pinning, bad token, full download, backpressure with a small buffer,
-reconnect before ACK). The server can be embedded in tests with
+reconnect before ACK, selecting and switching files). The server can be embedded in tests with
 `st_server::Server::bind(Config { .. })` and `.spawn()`.
 
 CI (`.github/workflows/ci.yml`) runs fmt, clippy and tests on Linux and builds
