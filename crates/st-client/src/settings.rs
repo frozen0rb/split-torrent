@@ -39,6 +39,10 @@ pub struct SavedTorrent {
     pub torrent_file: PathBuf,
     pub download_dir: PathBuf,
     pub paused: bool,
+    /// One entry per torrent file; `None` (older settings) keeps the
+    /// selection stored with the download's resume state.
+    #[serde(default)]
+    pub selected: Option<Vec<bool>>,
 }
 
 impl Settings {
@@ -102,6 +106,7 @@ mod tests {
             torrent_file: p,
             download_dir: tmp.clone(),
             paused: false,
+            selected: Some(vec![true, false]),
         });
         assert_eq!(s.find(&ih), Some(0));
         assert_eq!(s.find(&[0; 20]), None);
