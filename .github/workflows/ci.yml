@@ -22,6 +22,8 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets
       - run: cargo test --workspace
+      - name: tests on a host without an IPv6 stack
+        run: ./scripts/test-without-ipv6.sh
 
   linux-release:
     name: release x86_64-unknown-linux-musl
