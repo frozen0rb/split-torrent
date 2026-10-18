@@ -940,8 +940,8 @@ mod tests {
         let cfg = StateConfig {
             ops: ops.clone(),
             policy: SavePolicy {
-                retry_min: Duration::from_millis(50),
-                retry_max: Duration::from_millis(50),
+                retry_min: Duration::from_millis(500),
+                retry_max: Duration::from_millis(500),
                 ..fast_policy()
             },
             ..st(&tmp)
@@ -963,13 +963,13 @@ mod tests {
         assert_eq!(ops.overwrites.load(Ordering::SeqCst), 1);
         assert!(!s.state_saved());
         for _ in 0..2 {
-            std::thread::sleep(Duration::from_millis(60));
+            std::thread::sleep(Duration::from_millis(550));
             s.flush().unwrap();
         }
         assert_eq!(ops.overwrites.load(Ordering::SeqCst), 3);
         assert!(!s.state_saved());
         assert_eq!(s.unsaved_since(), Some(since));
-        std::thread::sleep(Duration::from_millis(60));
+        std::thread::sleep(Duration::from_millis(550));
         s.flush().unwrap();
         assert!(s.state_saved());
         assert!(s.state_problem().is_none() && s.unsaved_since().is_none());
