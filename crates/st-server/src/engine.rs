@@ -124,6 +124,12 @@ fn nz(v: u64) -> Option<NonZeroU32> {
 impl Engine {
     pub async fn new(config: &Config, cancel: CancellationToken) -> anyhow::Result<Arc<Self>> {
         let base_download = nz(config.download_limit);
+        let ipv6 = crate::net::resolve_ipv6(config.ipv6)?;
+        let bt_ip: std::net::IpAddr = if ipv6 {
+            std::net::Ipv6Addr::UNSPECIFIED.into()
+        } else {
+            std::net::Ipv4Addr::UNSPECIFIED.into()
+        };
         let opts = SessionOptions {
             dht: config.dht.then(|| librqbit::DhtSessionConfig {
                 persistence: None,
@@ -134,9 +140,9 @@ impl Engine {
             persistence: None,
             listen: Some(ListenerOptions {
                 mode: ListenerMode::TcpOnly,
-                listen_addr: SocketAddr::from(([0, 0, 0, 0], config.bt_port)),
+                listen_addr: SocketAddr::new(bt_ip, config.bt_port),
                 enable_upnp_port_forwarding: config.upnp,
-                ipv4_only: true,
+                ipv4_only: !ipv6,
                 ..Default::default()
             }),
             cancellation_token: Some(cancel),
@@ -146,8 +152,9 @@ impl Engine {
             },
             peer_limit: Some(config.peer_limit),
             disable_upload: !config.seed,
-            disable_local_service_discovery: !config.lsd,
-            ipv4_only: true,
+            // librqbit's LSD always binds [::], so it cannot work without IPv6.
+            disable_local_service_discovery: !config.lsd || !ipv6,
+            ipv4_only: !ipv6,
             ..Default::default()
         };
         // librqbit wants a default output folder; our storage never uses it.

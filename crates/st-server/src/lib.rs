@@ -25,6 +25,7 @@ pub mod buffer;
 pub mod config;
 mod conn;
 pub mod engine;
+pub mod net;
 pub mod storage;
 pub mod tls;
 
