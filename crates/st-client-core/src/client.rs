@@ -152,7 +152,7 @@ pub struct TorrentSnapshot {
     pub bytes_wanted: u64,
     /// Bytes of the selected files on disk.
     pub bytes_have: u64,
-    /// Per file: bytes on disk. Only meaningful for selected files.
+    /// Per file: bytes on disk; 0 for files that are not selected.
     pub file_bytes_have: Vec<u64>,
     /// Bytes per second received from the server.
     pub recv_speed: u64,

@@ -63,8 +63,8 @@ pub struct Progress {
     pub bytes_wanted: u64,
     /// Bytes of the selected files that are on disk.
     pub bytes_have: u64,
-    /// Per file: bytes covered by present pieces. Only meaningful for
-    /// selected files.
+    /// Per file: bytes on disk. Always 0 for files that are not selected,
+    /// even if data from an earlier selection is still there.
     pub file_bytes_have: Vec<u64>,
 }
 
@@ -178,8 +178,8 @@ impl Storage {
     }
 
     fn apply_selection(&mut self, selected: &[bool]) -> Result<(), StorageError> {
-        for i in 0..self.meta.files.len() {
-            let want = selected[i] && !self.meta.files[i].pad;
+        for (i, &sel) in selected.iter().enumerate() {
+            let want = sel && !self.meta.files[i].pad;
             let was_selected = self.selected[i];
             if want && self.files[i].is_none() {
                 self.open_file(i)?;
@@ -254,7 +254,9 @@ impl Storage {
         let mut file_bytes_have = vec![0u64; meta.files.len()];
         for p in self.have.iter_ones() {
             for (fi, _, _, len) in meta.piece_segments(p) {
-                file_bytes_have[fi] += len as u64;
+                if self.selected[fi] {
+                    file_bytes_have[fi] += len as u64;
+                }
             }
         }
         let sel = |i: &usize| self.selected[*i];
@@ -316,8 +318,8 @@ impl Storage {
         self.have.set(index, true);
         self.progress.pieces_have += 1;
         for (fi, _, _, len) in segments {
-            self.progress.file_bytes_have[fi] += len as u64;
             if self.selected[fi] {
+                self.progress.file_bytes_have[fi] += len as u64;
                 self.progress.bytes_have += len as u64;
             }
         }
@@ -586,7 +588,7 @@ mod tests {
         s.flush().unwrap();
         assert!(s.complete());
         assert_eq!(s.progress().bytes_have, 10);
-        assert_eq!(s.progress().file_bytes_have, vec![10, 0, 6]);
+        assert_eq!(s.progress().file_bytes_have, vec![10, 0, 0]);
         assert_eq!(fs::read(root.join("dir/a.bin")).unwrap(), data[0]);
         assert!(!root.join("c.bin").exists());
         drop(s);

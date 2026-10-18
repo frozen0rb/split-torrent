@@ -352,10 +352,14 @@ async fn downloads_selected_files_and_changes_selection_mid_download() {
     assert_eq!(done.bytes_have, a_len + FILES[1].1 as u64);
     assert_file(&seed.tag, "a.bin", &seed.data_dir, &root);
     assert_file(&seed.tag, "sub/b.bin", &seed.data_dir, &root);
-    // c.bin keeps what it had but is not complete.
-    let c_have = done.file_bytes_have[c];
-    assert!(c_have > 0 && c_have < FILES[2].1 as u64, "{c_have}");
-    assert_eq!(std::fs::metadata(path(c)).unwrap().len(), FILES[2].1 as u64);
+    // c.bin keeps the data it had on disk but is not complete.
+    assert_eq!(done.file_bytes_have[c], 0, "not selected");
+    let want_c = std::fs::read(seed.data_dir.join(file_name(&seed.tag, "sub/c.bin"))).unwrap();
+    let got_c = std::fs::read(path(c)).unwrap();
+    assert_eq!(got_c.len(), want_c.len());
+    let same = want_c.iter().zip(&got_c).filter(|(x, y)| x == y).count() as u64;
+    assert!(same >= mid.file_bytes_have[c], "{same}");
+    assert!(got_c != want_c, "c.bin must not be complete");
 
     // Everything: the rest of c.bin arrives and the tree matches the seed.
     let all = sel(&[a, b, c]);
