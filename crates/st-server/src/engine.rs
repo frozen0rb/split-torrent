@@ -1,6 +1,6 @@
 //! librqbit session plus the registry of torrents managed for clients.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,6 +25,9 @@ use crate::Config;
 /// Swarm download rate while under backpressure. One BitTorrent block per
 /// second; the rate limiter cannot go below one block.
 const THROTTLED_BPS: u32 = 16 * 1024;
+/// Partial pieces of deselected files that librqbit stopped writing are
+/// freed after this long.
+const STALE_PARTIAL: Duration = Duration::from_secs(30);
 
 pub type ConnId = u64;
 
@@ -63,6 +66,8 @@ struct EntryState {
     handle: Option<Arc<ManagedTorrent>>,
     user_paused: bool,
     owner: Option<ConnId>,
+    /// Client file selection, one flag per torrent file.
+    selected: Vec<bool>,
 }
 
 impl TorrentEntry {
@@ -85,17 +90,57 @@ impl TorrentEntry {
         }
     }
 
-    /// Files that still contain at least one piece the client lacks, or
-    /// `None` if that is every file.
-    fn only_files(&self, have: &Bitfield) -> Option<Vec<usize>> {
-        let needed: Vec<usize> = self
-            .files
+    /// Selected files that still contain at least one piece the client
+    /// lacks. librqbit downloads exactly the pieces overlapping them.
+    fn only_files(&self, have: &Bitfield, selected: &[bool]) -> Vec<usize> {
+        self.files
             .iter()
+            .zip(selected)
             .enumerate()
-            .filter(|(_, f)| f.pieces.clone().any(|p| !have.get(p)))
+            .filter(|(_, (f, &sel))| sel && f.pieces.clone().any(|p| !have.get(p)))
             .map(|(i, _)| i)
-            .collect();
-        (needed.len() != self.files.len()).then_some(needed)
+            .collect()
+    }
+
+    /// Pieces overlapping at least one selected file.
+    fn wanted(&self, selected: &[bool]) -> Bitfield {
+        let mut b = Bitfield::new(self.geom.piece_count());
+        for (f, _) in self.files.iter().zip(selected).filter(|(_, &s)| s) {
+            for p in f.pieces.clone() {
+                b.set(p, true);
+            }
+        }
+        b
+    }
+
+    fn selection(&self, files: &[u32]) -> Result<Vec<bool>, ClientError> {
+        let mut sel = vec![false; self.files.len()];
+        for &f in files {
+            *sel.get_mut(f as usize).ok_or_else(|| {
+                ClientError::new(
+                    ErrorCode::BadTorrent,
+                    format!("file index {f} out of range ({} files)", self.files.len()),
+                )
+            })? = true;
+        }
+        Ok(sel)
+    }
+
+    fn check_have(&self, have: Bitfield) -> Result<Bitfield, ClientError> {
+        let piece_count = self.geom.piece_count();
+        if have.is_empty() {
+            Ok(Bitfield::new(piece_count))
+        } else if have.len() == piece_count {
+            Ok(have)
+        } else {
+            Err(ClientError::new(
+                ErrorCode::BadTorrent,
+                format!(
+                    "bitfield has {} bits, torrent has {piece_count} pieces",
+                    have.len()
+                ),
+            ))
+        }
     }
 }
 
@@ -191,7 +236,8 @@ impl Engine {
         self.torrents.lock().by_id.get(&id).cloned()
     }
 
-    /// Throttles the whole session while the buffer is under pressure.
+    /// Throttles the whole session while the buffer is under pressure, and
+    /// frees abandoned partial pieces of deselected files.
     async fn backpressure_loop(self: Arc<Self>) {
         let mut on = false;
         let cancel = self.session.cancellation_token().clone();
@@ -200,6 +246,13 @@ impl Engine {
                 _ = cancel.cancelled() => return,
                 _ = self.pool.changed() => {}
                 _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+            }
+            let entries: Vec<_> = self.torrents.lock().by_id.values().cloned().collect();
+            for e in entries {
+                let n = e.buffer().drop_stale(STALE_PARTIAL);
+                if n > 0 {
+                    tracing::debug!(torrent = e.id, pieces = n, "freed stale deselected pieces");
+                }
             }
             let p = self.pool.pressure(on);
             if p != on {
@@ -225,23 +278,11 @@ impl Engine {
         conn: ConnId,
         torrent_bytes: Bytes,
         have: Bitfield,
+        files: Vec<u32>,
     ) -> Result<Arc<TorrentEntry>, ClientError> {
         let parsed = parse_torrent(&torrent_bytes)
             .map_err(|e| ClientError::new(ErrorCode::BadTorrent, format!("{e:#}")))?;
         let piece_count = parsed.geom.piece_count();
-        let have = if have.is_empty() {
-            Bitfield::new(piece_count)
-        } else if have.len() == piece_count {
-            have
-        } else {
-            return Err(ClientError::new(
-                ErrorCode::BadTorrent,
-                format!(
-                    "bitfield has {} bits, torrent has {piece_count} pieces",
-                    have.len()
-                ),
-            ));
-        };
         if u64::from(parsed.geom.piece_length) * 4 > self.pool.limit() {
             return Err(ClientError::new(
                 ErrorCode::BadTorrent,
@@ -260,18 +301,9 @@ impl Engine {
                 .and_then(|id| g.by_id.get(id).cloned())
         };
         if let Some(entry) = existing {
-            let buffer = entry.buffer();
-            let lost = buffer.lost_pieces(&have);
-            if lost.is_empty() {
-                buffer.merge_have(&have);
-            } else {
-                tracing::warn!(
-                    torrent = entry.id,
-                    lost = lost.len(),
-                    "client lost pieces that were already freed, restarting torrent"
-                );
-                self.start(&entry, have).await?;
-            }
+            let have = entry.check_have(have)?;
+            let selected = entry.selection(&files)?;
+            self.reselect(&entry, have, selected).await?;
             let mut st = entry.state.lock();
             st.owner = Some(conn);
             st.buffer.reset_unsent();
@@ -279,30 +311,36 @@ impl Engine {
             return Ok(entry);
         }
 
+        let file_count = parsed.files.len();
+        let mut entry = TorrentEntry {
+            id: 0,
+            info_hash: parsed.info_hash,
+            name: parsed.name,
+            files: parsed.files,
+            torrent_bytes,
+            state: Mutex::new(EntryState {
+                buffer: TorrentBuffer::new(
+                    self.pool.clone(),
+                    parsed.geom.clone(),
+                    Bitfield::new(piece_count),
+                    Bitfield::new(piece_count),
+                ),
+                handle: None,
+                user_paused: false,
+                owner: Some(conn),
+                selected: vec![false; file_count],
+            }),
+            geom: parsed.geom,
+        };
+        let have = entry.check_have(have)?;
+        entry.state.get_mut().selected = entry.selection(&files)?;
         let entry = {
             let mut g = self.torrents.lock();
-            let id = g.next_id;
+            entry.id = g.next_id;
             g.next_id += 1;
-            let entry = Arc::new(TorrentEntry {
-                id,
-                info_hash: parsed.info_hash,
-                name: parsed.name,
-                files: parsed.files,
-                torrent_bytes,
-                state: Mutex::new(EntryState {
-                    buffer: TorrentBuffer::new(
-                        self.pool.clone(),
-                        parsed.geom.clone(),
-                        Bitfield::new(piece_count),
-                    ),
-                    handle: None,
-                    user_paused: false,
-                    owner: Some(conn),
-                }),
-                geom: parsed.geom,
-            });
-            g.by_hash.insert(entry.info_hash, id);
-            g.by_id.insert(id, entry.clone());
+            let entry = Arc::new(entry);
+            g.by_hash.insert(entry.info_hash, entry.id);
+            g.by_id.insert(entry.id, entry.clone());
             entry
         };
         if let Err(e) = self.start(&entry, have).await {
@@ -314,16 +352,88 @@ impl Engine {
         Ok(entry)
     }
 
-    /// (Re)starts the librqbit torrent with a fresh buffer.
-    async fn start(&self, entry: &TorrentEntry, have: Bitfield) -> Result<(), ClientError> {
-        self.stop_librqbit(entry).await;
-        let buffer = TorrentBuffer::new(self.pool.clone(), entry.geom.clone(), have.clone());
-        let old = std::mem::replace(&mut entry.state.lock().buffer, buffer.clone());
-        old.close();
-        if have.is_full() {
+    /// Handles `SetFiles`.
+    pub async fn set_files(
+        &self,
+        id: TorrentId,
+        files: Vec<u32>,
+        have: Bitfield,
+    ) -> Result<(), ClientError> {
+        let entry = self
+            .get(id)
+            .ok_or_else(|| ClientError::new(ErrorCode::UnknownTorrent, "unknown torrent"))?;
+        let have = entry.check_have(have)?;
+        let selected = entry.selection(&files)?;
+        self.reselect(&entry, have, selected).await
+    }
+
+    /// Applies a client bitfield and file selection to a known torrent.
+    /// Updates librqbit in place when possible; restarts it when the client
+    /// now lacks pieces librqbit already has (it would never fetch them
+    /// again) or when it had been stopped after finishing.
+    async fn reselect(
+        &self,
+        entry: &TorrentEntry,
+        have: Bitfield,
+        selected: Vec<bool>,
+    ) -> Result<(), ClientError> {
+        let wanted = entry.wanted(&selected);
+        let (buffer, handle, old) = {
+            let mut st = entry.state.lock();
+            let old = std::mem::replace(&mut st.selected, selected.clone());
+            (st.buffer.clone(), st.handle.clone(), old)
+        };
+        let lost = buffer.lost_pieces(&have, &wanted);
+        if !lost.is_empty() {
+            tracing::info!(
+                torrent = entry.id,
+                lost = lost.len(),
+                "client needs pieces that were already freed, restarting torrent"
+            );
+            return self.start(entry, have).await;
+        }
+        buffer.merge_have(&have);
+        buffer.set_wanted(wanted);
+        if buffer.is_finished() {
+            self.stop_librqbit(entry).await;
             return Ok(());
         }
-        let only_files = entry.only_files(&have);
+        let done = buffer.done();
+        let Some(handle) = handle else {
+            return self.start(entry, done).await;
+        };
+        if old == selected {
+            return Ok(());
+        }
+        let only: HashSet<usize> = entry.only_files(&done, &selected).into_iter().collect();
+        if let Err(e) = self.session.update_only_files(&handle, &only).await {
+            tracing::info!(
+                torrent = entry.id,
+                "cannot update files in place ({e:#}), restarting"
+            );
+            return self.start(entry, done).await;
+        }
+        Ok(())
+    }
+
+    /// (Re)starts the librqbit torrent with a fresh buffer. Complete pieces
+    /// of the old buffer that are still needed are carried over.
+    async fn start(&self, entry: &TorrentEntry, have: Bitfield) -> Result<(), ClientError> {
+        self.stop_librqbit(entry).await;
+        let selected = entry.state.lock().selected.clone();
+        let buffer = TorrentBuffer::new(
+            self.pool.clone(),
+            entry.geom.clone(),
+            have.clone(),
+            entry.wanted(&selected),
+        );
+        let old = std::mem::replace(&mut entry.state.lock().buffer, buffer.clone());
+        buffer.adopt_complete(&old);
+        old.close();
+        if buffer.is_finished() {
+            return Ok(());
+        }
+        let only_files = Some(entry.only_files(&have, &selected));
         let paused = entry.state.lock().user_paused;
         let opts = AddTorrentOptions {
             paused,
@@ -426,7 +536,7 @@ impl Engine {
             let st = entry.state.lock();
             (st.buffer.clone(), st.handle.clone(), st.user_paused)
         };
-        let pieces_total = entry.geom.piece_count();
+        let pieces_total = buffer.wanted_count();
         let pieces_done = buffer.done_count();
         let mut peers = 0;
         let mut down_speed = 0;

@@ -100,6 +100,8 @@ struct Seed {
     addr: SocketAddr,
     torrent: bytes::Bytes,
     content: Vec<u8>,
+    /// Pieces overlapping each file, in torrent order.
+    file_pieces: Vec<std::ops::Range<u32>>,
 }
 
 async fn start_seed(dir: &Path) -> Seed {
@@ -139,6 +141,7 @@ async fn start_seed(dir: &Path) -> Seed {
     for f in info.iter_file_details() {
         content.extend(std::fs::read(data.join(f.filename.to_pathbuf())).unwrap());
     }
+    let file_pieces = info.iter_file_details_ext().map(|f| f.pieces).collect();
     let session = Session::new_with_opts(
         dir.to_path_buf(),
         SessionOptions {
@@ -177,6 +180,7 @@ async fn start_seed(dir: &Path) -> Seed {
         addr: SocketAddr::from(([127, 0, 0, 1], port)),
         torrent,
         content,
+        file_pieces,
     }
 }
 
@@ -261,6 +265,7 @@ async fn downloads_from_seed_with_backpressure_and_resume() {
     c.send(ClientMessage::AddTorrent {
         torrent_bytes: seed.torrent.clone(),
         have: have.clone(),
+        files: vec![0, 1],
     })
     .await
     .unwrap();
@@ -325,6 +330,7 @@ async fn downloads_from_seed_with_backpressure_and_resume() {
     c.send(ClientMessage::AddTorrent {
         torrent_bytes: seed.torrent.clone(),
         have,
+        files: vec![0, 1],
     })
     .await
     .unwrap();
@@ -447,6 +453,7 @@ async fn buffer_limit_holds_when_client_does_not_ack() {
     c.send(ClientMessage::AddTorrent {
         torrent_bytes: seed.1.clone(),
         have: Bitfield::default(),
+        files: vec![0],
     })
     .await
     .unwrap();
@@ -504,5 +511,167 @@ async fn buffer_limit_holds_when_client_does_not_ack() {
     tokio::time::timeout(Duration::from_secs(60), finish)
         .await
         .expect("download did not finish after ACKs");
+    h.shutdown().await;
+}
+
+fn pieces_of(seed: &Seed, files: &[usize]) -> std::collections::BTreeSet<u32> {
+    files
+        .iter()
+        .flat_map(|&f| seed.file_pieces[f].clone())
+        .collect()
+}
+
+/// Receives (and optionally ACKs) pieces until the server reports
+/// `Finished` for exactly `want` selected pieces, checking every piece's data
+/// and that it belongs to `allowed`.
+async fn drain_until_finished(
+    c: &mut Client,
+    seed: &Seed,
+    tid: u32,
+    allowed: &std::collections::BTreeSet<u32>,
+    want: u32,
+) -> std::collections::BTreeSet<u32> {
+    let mut got = std::collections::BTreeSet::new();
+    let run = async {
+        loop {
+            match c.next().await.unwrap().unwrap() {
+                ServerMessage::Piece { index, data, .. } => {
+                    assert!(allowed.contains(&index), "piece {index} is not selected");
+                    let start = index as usize * PIECE as usize;
+                    assert_eq!(&data[..], &seed.content[start..start + data.len()]);
+                    got.insert(index);
+                    c.send(ClientMessage::Ack {
+                        torrent_id: tid,
+                        index,
+                    })
+                    .await
+                    .unwrap();
+                }
+                ServerMessage::Status {
+                    state,
+                    pieces_total,
+                    pieces_done,
+                    ..
+                } if state == TorrentState::Finished => {
+                    assert_eq!((pieces_done, pieces_total), (want, want));
+                    return;
+                }
+                ServerMessage::Error { msg, .. } => panic!("server error: {msg}"),
+                _ => {}
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(60), run)
+        .await
+        .expect("selection did not finish");
+    got
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn downloads_selected_files_and_follows_selection_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let seed = start_seed(dir.path()).await;
+    let server = Server::bind(server_config(dir.path(), seed.addr))
+        .await
+        .unwrap();
+    let (addr, fp, token) = (
+        server.local_addr(),
+        server.fingerprint().to_owned(),
+        server.token().to_owned(),
+    );
+    let h = server.spawn();
+    let pool = h.engine.pool().clone();
+    let piece_count = seed.content.len().div_ceil(PIECE as usize) as u32;
+    let only0 = pieces_of(&seed, &[0]);
+    let only1 = pieces_of(&seed, &[1]);
+    let shared: Vec<u32> = only0.intersection(&only1).copied().collect();
+    assert_eq!(shared.len(), 1, "the files share one piece");
+
+    let (mut c, _) = connect(addr, &fp, &token).await;
+    c.send(ClientMessage::AddTorrent {
+        torrent_bytes: seed.torrent.clone(),
+        have: Bitfield::default(),
+        files: vec![1],
+    })
+    .await
+    .unwrap();
+    let tid = match c.next().await.unwrap().unwrap() {
+        ServerMessage::TorrentAdded { torrent_id, .. } => torrent_id,
+        m => panic!("unexpected {m:?}"),
+    };
+
+    // Receive all of file 1 without ACKing: it stays buffered.
+    let mut got = std::collections::BTreeSet::new();
+    while got.len() < only1.len() {
+        let m = tokio::time::timeout(Duration::from_secs(60), c.next())
+            .await
+            .expect("timed out waiting for file 1")
+            .unwrap()
+            .unwrap();
+        if let ServerMessage::Piece { index, .. } = m {
+            assert!(only1.contains(&index), "piece {index} is not in file 1");
+            got.insert(index);
+        }
+    }
+    let size = |set: &std::collections::BTreeSet<u32>| -> u64 {
+        set.iter()
+            .map(|&i| (seed.content.len() - i as usize * PIECE as usize).min(PIECE as usize) as u64)
+            .sum()
+    };
+    assert_eq!(pool.used(), size(&only1));
+
+    // Switch to file 0: the buffered pieces of file 1 are freed, except the
+    // piece it shares with file 0.
+    c.send(ClientMessage::SetFiles {
+        torrent_id: tid,
+        files: vec![0],
+        have: Bitfield::default(),
+    })
+    .await
+    .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while pool.used() > size(&shared.iter().copied().collect()) {
+        assert!(tokio::time::Instant::now() < deadline, "{:?}", pool.stats());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The shared piece was already sent; ACK it like a client that stored it.
+    c.send(ClientMessage::Ack {
+        torrent_id: tid,
+        index: shared[0],
+    })
+    .await
+    .unwrap();
+    let mut allowed = only0.clone();
+    allowed.extend(&only1);
+    let mut have = Bitfield::new(piece_count);
+    for i in drain_until_finished(&mut c, &seed, tid, &allowed, only0.len() as u32).await {
+        if only0.contains(&i) {
+            have.set(i, true);
+        }
+    }
+    have.set(shared[0], true);
+    assert!(only0.iter().all(|&i| have.get(i)));
+    assert_eq!(pool.used(), 0);
+
+    // Select everything. The client dropped the shared piece because it only
+    // wrote file 0's part of it, so the server must fetch it again even
+    // though librqbit already had it.
+    have.set(shared[0], false);
+    c.send(ClientMessage::SetFiles {
+        torrent_id: tid,
+        files: vec![0, 1],
+        have: have.clone(),
+    })
+    .await
+    .unwrap();
+    let all: std::collections::BTreeSet<u32> = (0..piece_count).collect();
+    let rest = drain_until_finished(&mut c, &seed, tid, &all, piece_count).await;
+    let missing: std::collections::BTreeSet<u32> = have.iter_zeros().collect();
+    assert!(
+        missing.is_subset(&rest),
+        "missing {missing:?}, got {rest:?}"
+    );
+    assert!(rest.contains(&shared[0]));
+    assert!(rest.iter().all(|i| !only0.contains(i) || *i == shared[0]));
     h.shutdown().await;
 }

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use crate::Bitfield;
 
 /// Bumped on any incompatible wire change. The server rejects other versions.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Server-assigned torrent handle, stable for the lifetime of the server
 /// process. Re-adding the same torrent (same info-hash) returns the same id.
@@ -20,8 +20,23 @@ pub enum ClientMessage {
     /// Start (or continue) a torrent. `have` marks pieces the client already
     /// has on disk; the server will neither download nor send them. An empty
     /// bitfield (`len == 0`) means "nothing yet".
+    ///
+    /// `files` lists the indices (into the torrent's file list, in torrent
+    /// order, padding files included) of the files to download. The server
+    /// downloads and sends exactly the pieces that overlap at least one of
+    /// them, so a piece shared with an unselected file is sent whole.
     AddTorrent {
         torrent_bytes: Bytes,
+        have: Bitfield,
+        files: Vec<u32>,
+    },
+    /// Replaces the file selection of a running or paused torrent. `have` is
+    /// the client's current bitfield: when a file is added back, the client
+    /// may have dropped pieces it shares with files it did not write. Pieces
+    /// buffered on the server that are no longer selected are freed.
+    SetFiles {
+        torrent_id: TorrentId,
+        files: Vec<u32>,
         have: Bitfield,
     },
     /// The piece has been written and verified on the client; the server may
@@ -67,9 +82,12 @@ pub enum ServerMessage {
         down_speed: u64,
         /// Bytes per second to the swarm.
         up_speed: u64,
-        /// Fraction (0.0..=1.0) of pieces the client has acknowledged or had.
+        /// Fraction (0.0..=1.0) of the selected pieces the client has
+        /// acknowledged or had.
         progress: f32,
+        /// Selected pieces the client has.
         pieces_done: u32,
+        /// Pieces overlapping the selected files.
         pieces_total: u32,
         /// Bytes currently held in the server RAM buffer (all torrents).
         buffer_used: u64,
@@ -97,7 +115,7 @@ pub enum TorrentState {
     Initializing,
     Downloading,
     Paused,
-    /// Every piece has been acknowledged by the client.
+    /// Every selected piece has been acknowledged by the client.
     Finished,
     Error,
 }

@@ -163,7 +163,8 @@ impl Conn {
             ClientMessage::AddTorrent {
                 torrent_bytes,
                 have,
-            } => match self.engine.add(self.id, torrent_bytes, have).await {
+                files,
+            } => match self.engine.add(self.id, torrent_bytes, have, files).await {
                 Ok(entry) => {
                     self.send(entry.added_message()).await?;
                     self.own(entry);
@@ -173,6 +174,14 @@ impl Conn {
             },
             ClientMessage::Ack { torrent_id, index } => {
                 let r = self.engine.ack(torrent_id, index).await;
+                self.reply(Some(torrent_id), r).await
+            }
+            ClientMessage::SetFiles {
+                torrent_id,
+                files,
+                have,
+            } => {
+                let r = self.engine.set_files(torrent_id, files, have).await;
                 self.reply(Some(torrent_id), r).await
             }
             ClientMessage::Pause { torrent_id } => {
