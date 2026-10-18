@@ -86,6 +86,7 @@ all of them. The ones you are most likely to change:
 | `peer_limit` | `64` | Max peers per torrent |
 | `download_limit` / `upload_limit` | `0` (unlimited) | Swarm rate limits, e.g. `"10MiB"` |
 | `seed` | `true` | Serve pieces that are still in RAM to other peers |
+| `ipv6` | auto | BitTorrent over IPv6 as well as IPv4; see [IPv4-only hosts](#ipv4-only-hosts) |
 
 Command-line flags override the file: `--listen`, `--token` (or
 `ST_SERVER_TOKEN`), `--state-dir`, `--buffer-limit`, `--bt-port`.
@@ -116,6 +117,27 @@ or with nftables/iptables, the equivalent `tcp dport { 7443, 4240 } accept`.
 DHT uses a UDP port chosen at startup; it works through outgoing traffic, so no
 inbound UDP rule is required. If your provider has a cloud firewall / security
 group, open the same ports there.
+
+### IPv4-only hosts
+
+Some servers have no IPv6 stack at all: the kernel was booted with
+`ipv6.disable=1`, or it is an OpenVZ/LXC container. There `/proc/net/if_inet6`
+does not exist and every IPv6 socket fails with *Address family not supported
+by protocol (os error 97)*.
+
+st-server detects this at startup by trying to create an IPv6 socket. If that
+fails it logs `IPv6 is not available on this host, BitTorrent uses IPv4 only`
+and binds everything (BitTorrent listener, DHT, UDP trackers) to IPv4. Local
+service discovery is turned off in that case because librqbit only supports it
+on IPv6 sockets. When IPv6 works, the BitTorrent listener and DHT use both
+IPv4 and IPv6.
+
+Set `ipv6 = false` in the config to force IPv4 only, or `ipv6 = true` to make
+startup fail if IPv6 is missing. The systemd unit allows both `AF_INET` and
+`AF_INET6`, so it is not the cause of this error. Do not remove `AF_INET6`
+from `RestrictAddressFamilies`; that produces the same error.
+
+`scripts/test-without-ipv6.sh` runs the test suite as if IPv6 were missing.
 
 ### 5. Swap on a 1 GB machine
 
