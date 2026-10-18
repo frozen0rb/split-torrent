@@ -70,6 +70,13 @@ pub fn torrents_dir() -> PathBuf {
         .join("torrents")
 }
 
+/// Where resume state (`.st-state`) is kept.
+pub fn state_dir() -> PathBuf {
+    eframe::storage_dir(APP_ID)
+        .map(|d| d.join("state"))
+        .unwrap_or_else(st_client_core::default_state_dir)
+}
+
 pub fn store_torrent_copy(dir: &Path, ih: &InfoHash, bytes: &[u8]) -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(dir)?;
     let path = dir.join(format!("{}.torrent", hex(ih)));

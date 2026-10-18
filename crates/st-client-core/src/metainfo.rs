@@ -8,6 +8,11 @@ use crate::bencode::{self, Value};
 
 pub type InfoHash = [u8; 20];
 
+/// Lowercase hex, as used in file names.
+pub fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileEntry {
     /// Sanitized path relative to the torrent root.

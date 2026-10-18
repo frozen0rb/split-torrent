@@ -296,7 +296,7 @@ are fetched; unticked files stop downloading, and the data already on disk is
 kept (it is not deleted). A piece that spans a selected and an unselected
 file is downloaded whole, but only the selected part is written; if the other
 file is selected later, that piece is fetched once more. The selection is
-saved with the settings and in `.st-state`.
+saved with the settings and in the state file (see below).
 
 The list shows per torrent: size and progress of the selected files, status, the server's download
 speed from the swarm, the transfer speed from the server to this PC, and the
@@ -306,23 +306,49 @@ use.
 ### Resume and `.st-state`
 
 The client checks every piece's SHA-1 again, writes it, syncs the file and
-records the piece in `<folder>\<name>.st-state` (a small bitfield) before it
-acknowledges the piece to the server, so the server only frees pieces that
+records the piece in a small state file (bitfield and file selection) before
+it acknowledges the piece to the server, so the server only frees pieces that
 are safely on disk. After a reconnect or an app restart the client sends
 this bitfield with the torrent, and only missing pieces are transferred.
 If a file was deleted or truncated, the pieces in it are fetched again.
-Deleting the `.st-state` file makes the client start that torrent from
-scratch.
+
+The state files are kept with the settings, not in the download folder:
+
+| OS | Folder |
+|---|---|
+| Windows | `%APPDATA%\split-torrent\data\state\` |
+| Linux | `~/.local/share/split-torrent/state/` (or `$XDG_DATA_HOME/split-torrent/state/`) |
+| macOS | `~/Library/Application Support/split-torrent/state/` |
+
+Each file is named `<info-hash>-<folder key>.st-state`. The folder key is
+derived from the download folder, so the same torrent in two folders has two
+states. Older versions wrote `<folder>\<name>.st-state` next to the
+download; such a file is moved to the new place automatically when the
+torrent is loaded. Deleting a state file makes the client start that
+torrent from scratch (existing data is overwritten as it arrives again).
+
+**Network shares (SMB/NAS).** Downloading straight to a share such as
+`\\nas\share\torrents` works. Keeping the state locally avoids most
+trouble with shares, and saving is robust anyway: the client writes
+`….st-state.tmp` and renames it over the old file, retries the rename a few
+times (about 1.5 s in total) when something on the NAS (indexing,
+antivirus) holds the file, and then overwrites the file in place instead. If
+saving still fails, the torrent is not stopped: the status shows a warning
+with the operation and path, the client retries with backoff, and it holds
+the server's acknowledgements for up to 30 s. After that it keeps
+downloading; pieces whose progress could not be saved may be fetched again
+after a restart. Only failures to write or sync the downloaded data itself
+pause a torrent with an error.
 
 ### Pause, resume, remove
 
 - **Pause** / **Resume** stop and restart the download on the server. The
   state is remembered across restarts.
 - **Remove → Keep downloaded files** removes the torrent from the list and
-  from the server; files and `.st-state` stay, so adding the same torrent
-  again later resumes it.
-- **Remove → Delete downloaded files** also deletes the files and the
-  `.st-state`.
+  from the server; files and the state file stay, so adding the same torrent
+  to the same folder later resumes it.
+- **Remove → Delete downloaded files** also deletes the files and the state
+  file.
 - **Files…** changes which files are downloaded (see above).
 - **Open** opens the download folder.
 

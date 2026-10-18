@@ -11,7 +11,8 @@ use futures::{SinkExt, StreamExt};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use st_client_core::testkit::{make_torrent, pseudo_random};
 use st_client_core::{
-    Backoff, Client, ClientConfig, ConnectionState, Event, Fingerprint, Metainfo, TorrentSnapshot,
+    Backoff, Client, ClientConfig, ConnectionState, Event, Fingerprint, Metainfo, StateConfig,
+    TorrentSnapshot,
 };
 use st_protocol::{
     server_framed, Bitfield, ClientMessage, ErrorCode, ServerCodec, ServerMessage, TorrentState,
@@ -31,6 +32,7 @@ struct Mock {
     addr: SocketAddr,
     fingerprint: Fingerprint,
     conns: mpsc::UnboundedReceiver<Conn>,
+    state: tempfile::TempDir,
 }
 
 async fn mock_server() -> Mock {
@@ -66,6 +68,7 @@ async fn mock_server() -> Mock {
         addr,
         fingerprint,
         conns,
+        state: tempfile::tempdir().unwrap(),
     }
 }
 
@@ -77,6 +80,7 @@ impl Mock {
             min: Duration::from_millis(50),
             max: Duration::from_millis(300),
         };
+        c.state = StateConfig::new(self.state.path());
         c
     }
 
@@ -560,4 +564,138 @@ async fn bad_token_reports_server_error_and_retries() {
         .await;
         assert!(format!("{ev:?}").contains("Unauthorized"), "{ev:?}");
     }
+}
+
+/// Rename over the state file is always denied (like the SMB share in the
+/// bug report); overwriting in place fails while `blocked` is set.
+#[derive(Debug, Default)]
+struct FlakyFs {
+    blocked: std::sync::atomic::AtomicBool,
+}
+
+impl st_client_core::persist::FileOps for FlakyFs {
+    fn rename(&self, _: &Path, _: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+    }
+
+    fn overwrite(&self, path: &Path, data: &[u8]) -> std::io::Result<()> {
+        if self.blocked.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        }
+        std::fs::write(path, data)
+    }
+}
+
+#[tokio::test]
+async fn state_save_failures_never_error_the_torrent() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let mut mock = mock_server().await;
+    let f = fixture();
+    let dir = tempfile::tempdir().unwrap();
+    let fs = Arc::new(FlakyFs::default());
+    let mut config = mock.config(TOKEN, mock.fingerprint);
+    config.state.ops = fs.clone();
+    config.state.policy = st_client_core::persist::SavePolicy {
+        rename_delays: vec![Duration::ZERO; 2],
+        retry_min: Duration::from_millis(50),
+        retry_max: Duration::from_millis(50),
+        ack_unsaved_after: Duration::from_millis(600),
+    };
+    let (client, mut rx) = Client::start(config, &tokio::runtime::Handle::current(), None);
+    client
+        .add_torrent(f.torrent.clone(), dir.path(), false, None)
+        .unwrap();
+    let mut conn = mock.next_conn().await;
+    accept_torrent(&mut conn, &f.meta, 1).await;
+
+    // Rename denied, overwrite works: acked normally, a notice is shown.
+    send_pieces(&mut conn, 1, &f.pieces, &[0, 1, 2]).await;
+    wait_event(
+        &mut rx,
+        |e| matches!(e, Event::Warning(w) if w.contains("overwriting")),
+    )
+    .await;
+
+    // Saving fails completely: Acks are held, the torrent only warns.
+    fs.blocked.store(true, SeqCst);
+    for i in [3, 4] {
+        conn.send(ServerMessage::Piece {
+            torrent_id: 1,
+            index: i,
+            data: f.pieces[i as usize].clone().into(),
+        })
+        .await
+        .unwrap();
+    }
+    let ev = wait_event(&mut rx, |e| {
+        matches!(
+            e,
+            Event::Torrent(TorrentSnapshot {
+                warning: Some(_),
+                ..
+            })
+        )
+    })
+    .await;
+    let Event::Torrent(s) = ev else {
+        unreachable!()
+    };
+    assert!(s.error.is_none() && !s.paused, "{s:?}");
+    let w = s.warning.unwrap();
+    assert!(
+        w.contains("saving progress (replace ") && w.contains(".st-state"),
+        "{w}"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), conn.next())
+            .await
+            .is_err()
+    );
+
+    // Once saving works again the held Acks go out.
+    fs.blocked.store(false, SeqCst);
+    let mut acked = Vec::new();
+    for _ in 0..2 {
+        let ClientMessage::Ack { index, .. } = recv(&mut conn).await else {
+            panic!("expected Ack")
+        };
+        acked.push(index);
+    }
+    acked.sort();
+    assert_eq!(acked, vec![3, 4]);
+    wait_event(&mut rx, |e| {
+        matches!(
+            e,
+            Event::Torrent(TorrentSnapshot {
+                warning: None,
+                pieces_have: 5,
+                ..
+            })
+        )
+    })
+    .await;
+
+    // A persistent failure: after the grace period pieces are acked anyway,
+    // so the download keeps going.
+    fs.blocked.store(true, SeqCst);
+    send_pieces(&mut conn, 1, &f.pieces, &[5, 6]).await;
+    fs.blocked.store(false, SeqCst);
+    send_pieces(&mut conn, 1, &f.pieces, &[7, 8]).await;
+    let ev = wait_event(&mut rx, complete).await;
+    let Event::Torrent(s) = ev else {
+        unreachable!()
+    };
+    assert!(s.error.is_none() && !s.paused);
+    assert_files(dir.path(), &f);
+    let entries: Vec<_> = std::fs::read_dir(mock.state.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert!(entries[0].ends_with(".st-state"));
+    assert!(!std::fs::read_dir(dir.path()).unwrap().any(|e| e
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .contains("st-state")));
 }

@@ -72,13 +72,14 @@ impl App {
 
     fn connect(&mut self, ctx: &egui::Context) {
         let s = &self.settings;
-        let config = match ClientConfig::new(&s.server, &s.token, &s.fingerprint) {
+        let mut config = match ClientConfig::new(&s.server, &s.token, &s.fingerprint) {
             Ok(c) => c,
             Err(e) => {
                 self.message(format!("Cannot connect: {e}"), true);
                 return;
             }
         };
+        config.state.state_dir = settings::state_dir();
         let ctx = ctx.clone();
         let (client, events) = Client::start(
             config,
@@ -446,6 +447,17 @@ impl App {
     }
 
     fn status_text(&self, s: &TorrentSnapshot) -> (String, Color32) {
+        let (text, color) = self.base_status(s);
+        match &s.warning {
+            Some(w) if s.error.is_none() => (
+                format!("{text} – warning: {w}"),
+                Color32::from_rgb(240, 170, 60),
+            ),
+            _ => (text, color),
+        }
+    }
+
+    fn base_status(&self, s: &TorrentSnapshot) -> (String, Color32) {
         let connected = matches!(self.conn, Some((ConnectionState::Connected { .. }, _)));
         if let Some(e) = &s.error {
             return (format!("Error: {e}"), Color32::from_rgb(230, 90, 80));
