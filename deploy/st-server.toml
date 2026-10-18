@@ -12,12 +12,10 @@ listen = "0.0.0.0:7443"
 state_dir = "/var/lib/st-server"
 
 # RAM for partially downloaded pieces plus pieces waiting for the client's ACK.
-# When it fills up, downloading from the swarm is throttled and then paused
-# until the client acknowledges pieces.
+# When unACKed pieces fill half of it, downloading from the swarm is throttled,
+# and new pieces wait while it is full, until the client acknowledges pieces.
+# Keep buffer_limit + 256MiB within the systemd MemoryMax.
 buffer_limit = "384MiB"
-
-# Swarm downloads are throttled while this many pieces are partially downloaded.
-max_inflight_pieces = 32
 
 # BitTorrent (TCP) listen port for incoming peers; open it in the firewall.
 bt_port = 4240
@@ -30,6 +28,9 @@ trackers = true
 # Serve pieces that are still in RAM to other peers.
 seed = true
 
+# Max peers per torrent. Lowered automatically for large pieces so partially
+# downloaded pieces fit in half of buffer_limit (about 2 pieces per peer for
+# 4 MiB pieces); the effective value is logged as "starting torrent".
 peer_limit = 64
 
 # Swarm rate limits in bytes per second (e.g. "10MiB"); 0 = unlimited.
