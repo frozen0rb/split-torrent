@@ -621,7 +621,11 @@ async fn downloads_selected_files_and_follows_selection_changes() {
     assert_eq!(pool.used(), size(&only1));
 
     // Switch to file 0: the buffered pieces of file 1 are freed, except the
-    // piece it shares with file 0.
+    // piece it shares with file 0. Paused, so pieces of file 0 do not refill
+    // the buffer before it is measured.
+    c.send(ClientMessage::Pause { torrent_id: tid })
+        .await
+        .unwrap();
     c.send(ClientMessage::SetFiles {
         torrent_id: tid,
         files: vec![0],
@@ -634,6 +638,9 @@ async fn downloads_selected_files_and_follows_selection_changes() {
         assert!(tokio::time::Instant::now() < deadline, "{:?}", pool.stats());
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    c.send(ClientMessage::Resume { torrent_id: tid })
+        .await
+        .unwrap();
     // The shared piece was already sent; ACK it like a client that stored it.
     c.send(ClientMessage::Ack {
         torrent_id: tid,
